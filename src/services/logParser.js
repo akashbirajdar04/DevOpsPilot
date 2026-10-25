@@ -93,6 +93,18 @@ export function extractFailureTargets(cleanLog) {
 }
 
 /**
+ * Strips GitHub Actions ISO timestamps and workflow annotations (##[error], etc.).
+ * @param {string} raw
+ * @returns {string}
+ */
+export function cleanGHActionsLog(raw) {
+  if (!raw) return "";
+  return raw
+    .replace(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s+/gm, "")
+    .replace(/##\[(?:error|warning|debug|notice)\]\s*/gm, "");
+}
+
+/**
  * Parse raw log, strip ANSI escapes, and extract a targeted failure window.
  * @param {string | Buffer} rawLog
  * @param {number} [maxLines=45]
@@ -100,7 +112,8 @@ export function extractFailureTargets(cleanLog) {
  */
 export function parseLog(rawLog, maxLines = 45) {
   const rawText = extractRawLogText(rawLog);
-  const cleanLog = stripAnsi(rawText).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const unstripped = stripAnsi(rawText).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const cleanLog = cleanGHActionsLog(unstripped);
   const lines = cleanLog.split("\n").map((l) => l.trimEnd()).filter(Boolean);
   const detectedTargets = extractFailureTargets(cleanLog);
 
@@ -114,13 +127,18 @@ export function parseLog(rawLog, maxLines = 45) {
     };
   }
 
-  // Find line indices where error patterns match
-  const errorIndices = [];
+  // Find line indices, prioritizing specific linter/compiler/test failures over generic exit codes
+  const specificIndices = [];
+  const genericIndices = [];
   lines.forEach((line, idx) => {
-    if (ERROR_PATTERNS.some((p) => p.test(line))) {
-      errorIndices.push(idx);
+    if (/\b(?:error|FAIL|FAILED|SyntaxError|TypeError|no-undef|no-unused-vars)\b/i.test(line)) {
+      specificIndices.push(idx);
+    } else if (ERROR_PATTERNS.some((p) => p.test(line))) {
+      genericIndices.push(idx);
     }
   });
+
+  const errorIndices = specificIndices.length > 0 ? specificIndices : genericIndices;
 
   if (errorIndices.length === 0) {
     const window = lines.slice(-maxLines);
@@ -133,13 +151,13 @@ export function parseLog(rawLog, maxLines = 45) {
     };
   }
 
-  // Center window around the last major failure
-  const lastErrorIdx = errorIndices[errorIndices.length - 1];
+  // Center window around the first specific error or last failure
+  const targetErrorIdx = specificIndices.length > 0 ? specificIndices[0] : errorIndices[errorIndices.length - 1];
   const beforeCount = Math.floor(maxLines * 0.4);
   const afterCount = maxLines - beforeCount;
 
-  let startIdx = Math.max(0, lastErrorIdx - beforeCount);
-  let endIdx = Math.min(lines.length, lastErrorIdx + afterCount);
+  let startIdx = Math.max(0, targetErrorIdx - beforeCount);
+  let endIdx = Math.min(lines.length, targetErrorIdx + afterCount);
 
   if (endIdx - startIdx < maxLines) {
     startIdx = Math.max(0, endIdx - maxLines);
@@ -163,9 +181,10 @@ export function parseLog(rawLog, maxLines = 45) {
  */
 export function extractCulpritLocation(logText) {
   if (!logText) return null;
+  const cleaned = cleanGHActionsLog(logText);
 
   // 1. Check for standard path/to/file.ext:line(:col) format
-  const directMatch = logText.match(/([a-zA-Z0-9_\-./\\]+\.(?:jsx?|tsx?|py|json|vue|go|rs)):(\d+)/i);
+  const directMatch = cleaned.match(/([a-zA-Z0-9_\-./\\]+\.(?:jsx?|tsx?|py|json|vue|go|rs)):(\d+)/i);
   if (directMatch) {
     let file = directMatch[1]
       .replace(/^.*[/\\]work[/\\][^/\\]+[/\\][^/\\]+[/\\]/, "")
@@ -175,7 +194,7 @@ export function extractCulpritLocation(logText) {
   }
 
   // 2. Check for ESLint / multi-line format
-  const lines = logText.split("\n");
+  const lines = cleaned.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const fileMatch = lines[i].match(/(?:[a-zA-Z0-9_\-\.]+[/\\])+[a-zA-Z0-9_\-\.]+\.(?:jsx?|tsx?|vue|py|go|rs|json)/);
     if (fileMatch) {

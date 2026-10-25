@@ -129,10 +129,10 @@ ${errorLogSnippet}
       iteration++;
       this.logger.info(`[Groq (${this.model})] Starting remediation iteration ${iteration}/${this.maxRetries}...`);
 
-      this._pruneGroqMessages(messages, 12000);
+      this._pruneGroqMessages(messages, 4000);
 
       let completion;
-      let delay = 4000;
+      let delay = 6000;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
           completion = await this.groq.chat.completions.create({
@@ -150,11 +150,23 @@ ${errorLogSnippet}
             groqErr.message?.includes("model_not_found") ||
             groqErr.message?.includes("does not exist or you do not have access to it");
 
-          if (isModelNotFound && this.model !== "openai/gpt-oss-120b") {
+          if (isModelNotFound && this.model !== "openai/gpt-oss-20b") {
             this.logger.warn(
-              `[Groq] Model '${this.model}' is not accessible on this API key. Falling back to 'openai/gpt-oss-120b'...`
+              `[Groq] Model '${this.model}' is not accessible on this API key. Falling back to 'openai/gpt-oss-20b'...`
             );
-            this.model = "openai/gpt-oss-120b";
+            this.model = "openai/gpt-oss-20b";
+            continue;
+          }
+
+          const isTPDLimit =
+            groqErr.message?.includes("tokens per day") ||
+            groqErr.message?.includes("TPD");
+
+          if (isTPDLimit && this.model !== "openai/gpt-oss-20b") {
+            this.logger.warn(
+              `[Groq] Daily token limit (TPD) reached for '${this.model}'. Switching to 'openai/gpt-oss-20b'...`
+            );
+            this.model = "openai/gpt-oss-20b";
             continue;
           }
 
@@ -167,9 +179,9 @@ ${errorLogSnippet}
 
           if (isRateLimit && attempt < 3) {
             this.logger.warn(
-              `[Groq] TPM limit reached. Pruning context and waiting ${delay / 1000}s (Attempt ${attempt}/3)...`
+              `[Groq] Rate limit reached. Pruning context and waiting ${delay / 1000}s (Attempt ${attempt}/3)...`
             );
-            this._pruneGroqMessages(messages, 6000);
+            this._pruneGroqMessages(messages, 2500);
             await new Promise((r) => setTimeout(r, delay));
             delay *= 1.5;
           } else {
