@@ -81,7 +81,7 @@ export default function healOpsApp(app) {
       }
     }
 
-    const { extractedWindow, totalLines, detectedTargets } = parseLog(rawLogBuffer || "CI Workflow Job Failed with exit code 1.", 45);
+    const { cleanLog, extractedWindow, totalLines, detectedTargets } = parseLog(rawLogBuffer || "CI Workflow Job Failed with exit code 1.", 45);
     app.log.info(
       `Parsed logs: Extracted focused failure window (${extractedWindow.split("\n").length} lines, ${detectedTargets?.length || 0} target addresses) from ${totalLines} total lines.`
     );
