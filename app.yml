@@ -1,6 +1,8 @@
 name: HealOps Self-Healing CI
 url: https://github.com/
 description: Autonomous Self-Healing CI/CD GitHub App Agent powered by Gemini 2.5 Flash
+hook_attributes:
+  url: https://smee.io/G5XSYBSml7CPCF7d
 default_permissions:
   actions: read
   checks: read

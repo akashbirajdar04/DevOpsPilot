@@ -38,3 +38,13 @@ This document records technical hurdles, runtime nuances, and architectural deci
   1. Created [app.yml](file:///c:/DevOpsPilot/app.yml) in root defining the required `name`, `url`, `default_permissions` (`actions: read`, `checks: read`, `contents: write`, `pull_requests: write`), and `default_events` (`workflow_run`).
   2. Added `"homepage"` and `"repository"` fields to [package.json](file:///c:/DevOpsPilot/package.json).
   3. Restarting `npm start` and clicking 'Register a GitHub App' now passes all GitHub manifest validations.
+
+---
+
+### Issue #5: GitHub Rejects Manifest with 'Hook url is not supported (localhost)'
+* **Problem**: GitHub webhooks are delivered over the public internet and cannot route to `http://localhost:3000/`. When Probot does not have a public `WEBHOOK_PROXY_URL` configured, it defaults to `http://localhost:3000/`, which GitHub's manifest API rejects with `"Error Hook url is not supported because it isn't reachable over the public Internet (localhost)"`.
+* **Impact**: Setup wizard cannot proceed past GitHub's manifest validation.
+* **Solution**:
+  1. Created a dedicated Smee.io webhook channel: `https://smee.io/G5XSYBSml7CPCF7d`.
+  2. Configured `WEBHOOK_PROXY_URL=https://smee.io/G5XSYBSml7CPCF7d` in [.env](file:///c:/DevOpsPilot/.env) and in [app.yml](file:///c:/DevOpsPilot/app.yml) under `hook_attributes.url`.
+  3. Smee proxies all public GitHub webhook events directly to your local development instance.
