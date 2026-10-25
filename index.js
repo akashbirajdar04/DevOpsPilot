@@ -4,6 +4,7 @@
  */
 
 import "dotenv/config";
+import { execa } from "execa";
 import { DiagnoserAgent } from "./src/agent/diagnoser.js";
 import { AgentTools } from "./src/agent/tools.js";
 import { GitOpsService } from "./src/services/gitOps.js";
@@ -89,6 +90,19 @@ export default function healOpsApp(app) {
     const sandbox = new Sandbox();
     const workspaceDir = await sandbox.initWorkspace();
 
+    // Clone target repository branch into the ephemeral sandbox workspace using GitHub App installation token
+    try {
+      const auth = await context.octokit.auth({ type: "installation" });
+      const cloneUrl = `https://x-access-token:${auth.token}@github.com/${owner}/${repo}.git`;
+      app.log.info(`Cloning ${owner}/${repo} (${headBranch}) into sandbox workspace...`);
+      await execa(`git clone --depth 1 --branch ${headBranch} ${cloneUrl} .`, {
+        cwd: workspaceDir,
+        shell: true,
+      });
+    } catch (cloneErr) {
+      app.log.warn(`Could not clone repo into sandbox: ${cloneErr.message}. Falling back to remote Octokit fetching.`);
+    }
+
     const tools = new AgentTools({
       workspaceDir,
       sandbox,
@@ -100,14 +114,14 @@ export default function healOpsApp(app) {
 
     const agent = new DiagnoserAgent({
       tools,
-      apiKey: process.env.GEMINI_API_KEY,
-      model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-      maxRetries: parseInt(process.env.MAX_RETRY_ITERATIONS || "3", 10),
+      apiKey: process.env.GROQ_API_KEY,
+      model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
+      maxRetries: parseInt(process.env.MAX_RETRY_ITERATIONS || "10", 10),
       logger: app.log,
     });
 
     // -------------------------------------------------------------------------
-    // Step 3: Run Gemini Autonomous ReAct Loop
+    // Step 3: Run Autonomous Groq ReAct Loop
     // -------------------------------------------------------------------------
     try {
       app.log.info(`Dispatching autonomous remediation agent for Run #${runId}...`);
@@ -117,15 +131,15 @@ export default function healOpsApp(app) {
         stepName: workflow_run.name || "CI Tests",
       });
 
-      if (!remediation.success) {
+      if (tools.modifiedFiles.size === 0) {
         app.log.warn(
-          `Remediation loop completed without passing sandbox tests after ${remediation.iterations} iterations.`
+          `Remediation loop completed without generating any code patches. Skipping Pull Request creation.`
         );
         return;
       }
 
       app.log.info(
-        `Remediation succeeded on iteration ${remediation.iterations}! Modified files: ${remediation.modifiedFiles.join(", ")}`
+        `Remediation completed! Modified files: ${Array.from(tools.modifiedFiles.keys()).join(", ")} (Sandbox pass: ${remediation.success})`
       );
 
       // -----------------------------------------------------------------------

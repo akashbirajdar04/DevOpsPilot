@@ -1,20 +1,20 @@
 # HealOps: Implementation Progress Tracker
 
-This document tracks the progress, component status, and verification tests for **HealOps** — an Autonomous Self-Healing CI/CD GitHub App Agent powered by Probot and Google Gemini 2.5 Flash.
+This document tracks the progress, component status, and verification tests for **HealOps** — an Autonomous Self-Healing CI/CD GitHub App Agent powered by Probot and Groq (`llama-3.3-70b-versatile` / `openai/gpt-oss-120b`).
 
 ---
 
 ## 📊 Component Status
 
 | Component | File Path | Status | Verification |
-| :--- | :--- | :---: | :---: |
-| **Dependencies & Configuration** | `package.json`, `.env.example` | 🟢 Complete | Verified (`node 22`, Probot, GenAI, Execa) |
+| :--- | :--- | :--- | :--- |
+| **Dependencies & Configuration** | `package.json`, `.env.example` | 🟢 Complete | Verified (`node 22`, Probot, Groq SDK, Execa) |
 | **Secret Scanner Guardrail** | `src/utils/secretGuard.js` | 🟢 Complete | Passed (`tests/agent.test.js`) |
 | **Log Parser & Cleaner** | `src/services/logParser.js` | 🟢 Complete | Passed (`tests/agent.test.js`) |
 | **Ephemeral Sandbox** | `src/services/sandbox.js` | 🟢 Complete | Passed (`tests/agent.test.js`) |
 | **Git & Octokit Automation** | `src/services/gitOps.js` | 🟢 Complete | Passed (Branching, Commit, and PR opener) |
-| **Agent Tools & Prompts** | `src/agent/tools.js`, `src/agent/prompts.js` | 🟢 Complete | Passed (`getRepoFile`, `applyFilePatch`, `runSandboxTest`) |
-| **Gemini 2.5 Flash ReAct Loop** | `src/agent/diagnoser.js` | 🟢 Complete | Passed (Function-calling loop with 3 retries) |
+| **Agent Tools & Prompts** | `src/agent/tools.js`, `src/agent/prompts.js` | 🟢 Complete | Passed (`listFiles`, `getRepoFile`, `applyFilePatch`, `runSandboxTest`) |
+| **Groq Autonomous ReAct Loop** | `src/agent/diagnoser.js` | 🟢 Complete | Passed (Function-calling loop with TPM protection) |
 | **Probot Event Ingestion** | `index.js` | 🟢 Complete | Passed (`workflow_run.completed` with loop guard) |
 | **Integration Test Suite** | `tests/agent.test.js` | 🟢 Complete | **4/4 Tests Passing (100%)** |
 
@@ -23,8 +23,8 @@ This document tracks the progress, component status, and verification tests for 
 ## 🎯 Verification Milestones
 
 - [x] Node.js 22 runtime check and project scaffolding.
-- [x] Configure `package.json` with ESM (`"type": "module"`), Probot, `@google/genai`, `strip-ansi`, `execa`, `dotenv`.
-- [x] Create `.env.example` with required GitHub App and Gemini credentials.
+- [x] Configure `package.json` with ESM (`"type": "module"`), Probot, `groq-sdk`, `strip-ansi`, `execa`, `dotenv`.
+- [x] Create `.env.example` with required GitHub App and Groq credentials.
 - [x] Implement `src/utils/secretGuard.js` to block leaked keys, passwords, and `.env` files.
 - [x] Implement `src/services/logParser.js` to strip ANSI codes and extract 150-line error tail.
 - [x] Implement `src/services/sandbox.js` to execute tests safely in isolated workspaces.

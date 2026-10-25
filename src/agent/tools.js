@@ -41,6 +41,22 @@ export class AgentTools {
   }
 
   /**
+   * List files and directories in a workspace directory.
+   * @param {string} [dirPath=""] - Relative directory path
+   * @returns {Promise<string>}
+   */
+  async listFiles(dirPath = "") {
+    try {
+      const targetDir = this._resolveSafePath(dirPath);
+      const entries = await fs.readdir(targetDir, { withFileTypes: true });
+      const items = entries.map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
+      return items.join("\n");
+    } catch (err) {
+      return `Error listing directory '${dirPath}': ${err.message}`;
+    }
+  }
+
+  /**
    * Fetch file content from the local workspace or remote GitHub branch.
    * @param {string} filePath - Relative file path
    * @returns {Promise<string>}
@@ -51,11 +67,11 @@ export class AgentTools {
       return this.modifiedFiles.get(filePath);
     }
 
+    let rawContent = "";
     // 2. Check local workspace filesystem
     try {
       const localPath = this._resolveSafePath(filePath);
-      const content = await fs.readFile(localPath, "utf-8");
-      return content;
+      rawContent = await fs.readFile(localPath, "utf-8");
     } catch {
       // 3. Fallback to remote Octokit getContent if available
       if (this.octokit && this.owner && this.repo) {
@@ -67,15 +83,24 @@ export class AgentTools {
             ref: this.ref,
           });
           if (!Array.isArray(data) && data.content) {
-            const decoded = Buffer.from(data.content, "base64").toString("utf-8");
-            return decoded;
+            rawContent = Buffer.from(data.content, "base64").toString("utf-8");
           }
         } catch (remoteErr) {
           return `Error: Could not find file '${filePath}' remotely or locally: ${remoteErr.message}`;
         }
+      } else {
+        return `Error: File '${filePath}' not found.`;
       }
-      return `Error: File '${filePath}' not found.`;
     }
+
+    if (!rawContent) return `Error: File '${filePath}' is empty or not found.`;
+    if (rawContent.length > 5000) {
+      return (
+        rawContent.slice(0, 5000) +
+        `\n\n... [Truncated: File content capped at first 5,000 characters to stay within TPM token limits]`
+      );
+    }
+    return rawContent;
   }
 
   /**
@@ -107,11 +132,15 @@ export class AgentTools {
     const result = await this.sandbox.runCommand(command);
     this.lastTestResult = result;
 
+    const note = this.modifiedFiles.size === 0 && result.exitCode === 0
+      ? "\n[NOTICE: Test exited with 0, but no code files have been modified yet. You must apply a code patch to the failing file to complete remediation.]"
+      : "";
+
     return JSON.stringify({
       status: result.exitCode === 0 ? "PASSED (Exit code: 0)" : `FAILED (Exit code: ${result.exitCode})`,
       exitCode: result.exitCode,
       timedOut: result.timedOut,
-      stdout: result.stdout.slice(-1500),
+      stdout: (result.stdout.slice(-1500) + note).trim(),
       stderr: result.stderr.slice(-1500),
       durationMs: result.durationMs,
     });

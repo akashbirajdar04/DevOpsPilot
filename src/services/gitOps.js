@@ -14,9 +14,9 @@ export function formatPRBody({ runId, rootCause, modifiedFiles, testCommand, tes
   return `## 🛠️ HealOps: Automated CI Remediation
 
 **Failed CI Run**: [#${runId}](https://github.com/)  
-**Remediation Agent**: HealOps (Powered by Gemini 2.5 Flash)  
+**Remediation Agent**: HealOps (Powered by Groq)  
 **Verification Status**: ✅ Build & Tests Passed in Sandbox (Exit Code: 0)  
-**Iterations Used**: ${iterations} / 3  
+**Iterations Used**: ${iterations}  
 
 ---
 

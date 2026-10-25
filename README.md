@@ -1,6 +1,6 @@
 # 🩺 HealOps: Autonomous Self-Healing CI/CD GitHub App Agent
 
-**HealOps** is an autonomous GitHub App agent built with **Probot** and powered by **Google Gemini 2.5 Flash**. It automatically intercepts failed GitHub Actions workflow runs, downloads and sanitizes terminal logs, investigates codebases via an agentic function-calling loop, tests patches inside an ephemeral sandbox, and opens verified Pull Requests.
+**HealOps** is an autonomous GitHub App agent built with **Probot** and powered by **Groq** (`llama-3.3-70b-versatile` / `openai/gpt-oss-120b`). It automatically intercepts failed GitHub Actions workflow runs, downloads and sanitizes terminal logs, investigates codebases via an agentic function-calling loop, tests patches inside an ephemeral sandbox, and opens verified Pull Requests.
 
 ---
 
@@ -25,15 +25,16 @@
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 3. Gemini 2.5 Flash Autonomous ReAct Loop                   │
+│ 3. Groq Autonomous ReAct Loop                               │
 │    (src/agent/diagnoser.js & src/agent/tools.js)            │
 │                                                             │
 │    Tools:                                                   │
+│    - listFiles(dir)                                         │
 │    - getRepoFile(path)                                      │
 │    - applyFilePatch(path, newContent)                       │
 │    - runSandboxTest(command)                                │
 │                                                             │
-│    [Max 3 Retries on Sandbox Failure]                       │
+│    [TPM Guard & Multi-Iteration Sandbox Verification]       │
 └──────────────────────────────┬──────────────────────────────┘
                                │
                                ▼ (Tests Pass: exitCode === 0)
@@ -63,7 +64,7 @@ healops/
 ├── index.js                  # Probot app entry point and event router
 ├── src/
 │   ├── agent/
-│   │   ├── diagnoser.js      # Gemini LLM function-calling agent loop
+│   │   ├── diagnoser.js      # Groq LLM function-calling agent loop
 │   │   ├── prompts.js        # SRE system prompts and tool schemas
 │   │   └── tools.js          # Agent tools (getRepoFile, applyFilePatch, runSandboxTest)
 │   ├── services/
@@ -99,7 +100,8 @@ Fill in your configuration:
 - `APP_ID`: Your GitHub App ID.
 - `PRIVATE_KEY`: Your GitHub App `.pem` private key string.
 - `WEBHOOK_SECRET`: Webhook secret configured on GitHub.
-- `GEMINI_API_KEY`: Google AI Studio API key.
+- `GROQ_API_KEY`: Groq API key (`gsk_...`).
+- `GROQ_MODEL`: Model ID (e.g. `llama-3.3-70b-versatile` or `openai/gpt-oss-120b`).
 
 ### 3. Run the GitHub App
 

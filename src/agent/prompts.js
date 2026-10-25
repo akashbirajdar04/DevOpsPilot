@@ -1,65 +1,94 @@
 /**
- * System prompts and tool declarations for Gemini 2.5 Flash agent.
+ * System prompts and tool declarations for Groq SRE agent.
  */
 
 export const SRE_SYSTEM_PROMPT = `You are HealOps, an autonomous Principal DevOps and Site Reliability Engineer.
 Your task is to analyze a failed CI/CD workflow run, identify the root cause, inspect files, apply surgical code patches, and verify the repair in an isolated sandbox.
 
 ### CORE OPERATIONAL DIRECTIVES:
-1. **Analyze Failure**: Read the error stack trace carefully. Identify missing packages, syntax errors, broken imports, type mismatches, or faulty tests.
-2. **Inspect Codebase**: Use \`getRepoFile\` to inspect the exact failing files, package.json, or test files. Do not guess contents.
-3. **Apply Targeted Fixes**: Use \`applyFilePatch\` to update the file content with the corrected code.
-4. **Sandbox Verification**: You MUST invoke \`runSandboxTest\` with the appropriate test command (e.g. 'npm test', 'npm install && npm test').
-5. **Iterative Repair**: If \`runSandboxTest\` fails (exitCode !== 0), review the new error output, adjust your patch, and re-test. You have up to 3 attempts.
-6. **Zero Secrets**: NEVER commit API keys, tokens, or credentials into the code or .env files.
-7. **Final Summary**: Once tests succeed with exitCode === 0, respond with a concise root-cause analysis and list of modified files.
+1. **Analyze Failure**: Read the error stack trace carefully. Identify the exact failing file(s) and error messages (e.g. lint errors, syntax errors, missing imports, test failures).
+2. **Inspect Failing Files First**: Immediately call \`getRepoFile\` on the EXACT file(s) cited in the failure log. Do not search for config files or unrelated files first.
+3. **Mandatory Code Patch**: You MUST use \`applyFilePatch\` to fix the error in the code. A remediation is NEVER complete without modifying the broken file(s).
+4. **Undefined Variables / Missing Imports**: If an error reports an undefined variable or missing identifier in a source file (e.g. 'toast is not defined'), the fix is to add the missing import statement in that specific source file (for example: \`import { toast } from 'react-toastify';\`). Directly patch the failing source file using \`applyFilePatch\`. Do NOT spend iterations searching for linter config files.
+5. **Targeted Sandbox Verification**: When using \`runSandboxTest\`, run the specific command that reproduces or checks the failure (e.g., if ESLint failed in 'frontend', run \`npm run lint --prefix frontend\` or \`cd frontend && npm run lint\`; if tests failed, run the test command for that package).
+6. **Verify Before Exiting**: Do not stop until you have run \`runSandboxTest\` and verified that the test passes with exit code 0.
+7. **Zero Secrets**: NEVER commit API keys, tokens, or credentials into the code or .env files.
+8. **Final Summary**: Once you have applied the patch and verification passes, provide a concise explanation of what you fixed.
 `;
 
 export const TOOL_DECLARATIONS = [
   {
-    name: "getRepoFile",
-    description: "Fetch file content from the target repository branch.",
-    parameters: {
-      type: "OBJECT",
-      properties: {
-        path: {
-          type: "STRING",
-          description: "Relative file path from repository root (e.g., 'package.json', 'src/index.js').",
+    type: "function",
+    function: {
+      name: "listFiles",
+      description: "List files and subdirectories in a directory relative to repo root (e.g., '', 'frontend', 'src').",
+      parameters: {
+        type: "object",
+        properties: {
+          directory: {
+            type: "string",
+            description: "Relative directory path (use '' for root).",
+          },
         },
       },
-      required: ["path"],
     },
   },
   {
-    name: "applyFilePatch",
-    description: "Write updated content to a file in the workspace.",
-    parameters: {
-      type: "OBJECT",
-      properties: {
-        path: {
-          type: "STRING",
-          description: "Relative file path to write to.",
+    type: "function",
+    function: {
+      name: "getRepoFile",
+      description: "Fetch file content from the target repository branch.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Relative file path from repository root (e.g., 'package.json', 'src/index.js').",
+          },
         },
-        newContent: {
-          type: "STRING",
-          description: "The complete updated content of the file.",
-        },
+        required: ["path"],
       },
-      required: ["path", "newContent"],
     },
   },
   {
-    name: "runSandboxTest",
-    description: "Execute a verification test command in the ephemeral sandbox (e.g., 'npm test').",
-    parameters: {
-      type: "OBJECT",
-      properties: {
-        command: {
-          type: "STRING",
-          description: "The shell command to execute inside the sandbox.",
+    type: "function",
+    function: {
+      name: "applyFilePatch",
+      description: "Write updated content to a file in the workspace.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Relative file path to write to.",
+          },
+          newContent: {
+            type: "string",
+            description: "The complete updated content of the file.",
+          },
         },
+        required: ["path", "newContent"],
       },
-      required: ["command"],
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "runSandboxTest",
+      description: "Execute a verification test command in the ephemeral sandbox (e.g., 'npm test').",
+      parameters: {
+        type: "object",
+        properties: {
+          command: {
+            type: "string",
+            description: "The shell command to execute inside the sandbox.",
+          },
+        },
+        required: ["command"],
+      },
     },
   },
 ];
+
+export const GROQ_TOOL_DECLARATIONS = TOOL_DECLARATIONS;
+

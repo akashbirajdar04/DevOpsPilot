@@ -1,7 +1,7 @@
 {
   "name": "healops",
   "version": "1.0.0",
-  "description": "Autonomous Self-Healing CI/CD GitHub App Agent powered by Gemini 2.5 Flash",
+  "description": "Autonomous Self-Healing CI/CD GitHub App Agent powered by Groq",
   "homepage": "https://github.com/",
   "repository": "https://github.com/akashbirajdar04/DevOpsPilot",
   "type": "module",
@@ -15,18 +15,19 @@
     "probot",
     "ci-cd",
     "self-healing",
-    "gemini",
+    "groq",
     "devops",
     "sre"
   ],
   "author": "HealOps",
   "license": "MIT",
   "dependencies": {
-    "@google/genai": "^2.31.0",
     "adm-zip": "^0.5.16",
     "dotenv": "^16.4.7",
     "execa": "^9.5.2",
+    "groq-sdk": "^1.6.0",
     "probot": "^13.4.1",
+    "smee-client": "^5.0.0",
     "strip-ansi": "^7.1.0"
   }
 }

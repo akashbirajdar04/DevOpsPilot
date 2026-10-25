@@ -123,47 +123,85 @@ console.log("PASS: Configuration status is ready.");
 
     const agent = new DiagnoserAgent({
       tools,
-      apiKey: "mock-key",
-      model: "gemini-2.5-flash",
+      apiKey: "mock-groq-key",
+      model: "llama-3.3-70b-versatile",
     });
 
-    // Mock Gemini API responses to simulate the ReAct loop:
+    // Mock Groq API completions to simulate the ReAct loop:
     // Iteration 1: Calls getRepoFile('config.json') -> calls applyFilePatch('config.json', '{"status":"ready"}') -> calls runSandboxTest('npm test')
     let mockStep = 0;
-    agent.ai = {
-      models: {
-        generateContent: async () => {
-          mockStep++;
-          if (mockStep === 1) {
-            return {
-              text: "Inspecting config.json to resolve the failure.",
-              functionCalls: [
-                { name: "getRepoFile", args: { path: "config.json" } },
-              ],
-            };
-          } else if (mockStep === 2) {
-            return {
-              text: "Updating status in config.json to 'ready'.",
-              functionCalls: [
-                {
-                  name: "applyFilePatch",
-                  args: {
-                    path: "config.json",
-                    newContent: JSON.stringify({ status: "ready" }, null, 2),
+    agent.groq = {
+      chat: {
+        completions: {
+          create: async () => {
+            mockStep++;
+            if (mockStep === 1) {
+              return {
+                choices: [
+                  {
+                    message: {
+                      role: "assistant",
+                      content: "Inspecting config.json to resolve the failure.",
+                      tool_calls: [
+                        {
+                          id: "call_1",
+                          type: "function",
+                          function: {
+                            name: "getRepoFile",
+                            arguments: JSON.stringify({ path: "config.json" }),
+                          },
+                        },
+                      ],
+                    },
                   },
-                },
-                {
-                  name: "runSandboxTest",
-                  args: { command: "npm test" },
-                },
-              ],
-            };
-          } else {
-            return {
-              text: "Successfully verified configuration status fix in config.json.",
-              functionCalls: [],
-            };
-          }
+                ],
+              };
+            } else if (mockStep === 2) {
+              return {
+                choices: [
+                  {
+                    message: {
+                      role: "assistant",
+                      content: "Updating status in config.json to 'ready'.",
+                      tool_calls: [
+                        {
+                          id: "call_2",
+                          type: "function",
+                          function: {
+                            name: "applyFilePatch",
+                            arguments: JSON.stringify({
+                              path: "config.json",
+                              newContent: JSON.stringify({ status: "ready" }, null, 2),
+                            }),
+                          },
+                        },
+                        {
+                          id: "call_3",
+                          type: "function",
+                          function: {
+                            name: "runSandboxTest",
+                            arguments: JSON.stringify({ command: "npm test" }),
+                          },
+                        },
+                      ],
+                    },
+                  },
+                ],
+              };
+            } else {
+              return {
+                choices: [
+                  {
+                    message: {
+                      role: "assistant",
+                      content: "Successfully verified configuration status fix in config.json.",
+                      tool_calls: [],
+                    },
+                  },
+                ],
+              };
+            }
+          },
         },
       },
     };
