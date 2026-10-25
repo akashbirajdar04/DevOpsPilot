@@ -94,10 +94,10 @@ export class AgentTools {
     }
 
     if (!rawContent) return `Error: File '${filePath}' is empty or not found.`;
-    if (rawContent.length > 5000) {
+    if (rawContent.length > 2500) {
       return (
-        rawContent.slice(0, 5000) +
-        `\n\n... [Truncated: File content capped at first 5,000 characters to stay within TPM token limits]`
+        rawContent.slice(0, 2500) +
+        `\n\n... [Truncated: File content capped at first 2,500 characters to stay within TPM token limits]`
       );
     }
     return rawContent;

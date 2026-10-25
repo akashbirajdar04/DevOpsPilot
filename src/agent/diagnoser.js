@@ -100,10 +100,10 @@ ${errorLogSnippet}
       iteration++;
       this.logger.info(`[Groq (${this.model})] Starting remediation iteration ${iteration}/${this.maxRetries}...`);
 
-      this._pruneGroqMessages(messages, 12000);
+      this._pruneGroqMessages(messages, 5000);
 
       let completion;
-      let delay = 4000;
+      let delay = 10000;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
           completion = await this.groq.chat.completions.create({
@@ -140,9 +140,9 @@ ${errorLogSnippet}
             this.logger.warn(
               `[Groq] TPM limit reached. Pruning context and waiting ${delay / 1000}s (Attempt ${attempt}/3)...`
             );
-            this._pruneGroqMessages(messages, 6000);
+            this._pruneGroqMessages(messages, 2500);
             await new Promise((r) => setTimeout(r, delay));
-            delay *= 1.5;
+            delay += 5000;
           } else {
             throw groqErr;
           }
@@ -216,7 +216,7 @@ ${errorLogSnippet}
   /**
    * Prune earlier tool messages to stay strictly within Groq's 8,000 TPM limit.
    */
-  _pruneGroqMessages(messages, maxChars = 12000) {
+  _pruneGroqMessages(messages, maxChars = 5000) {
     let totalLength = messages.reduce(
       (sum, m) => sum + (typeof m.content === "string" ? m.content.length : 0),
       0
@@ -224,8 +224,8 @@ ${errorLogSnippet}
     if (totalLength <= maxChars) return;
 
     for (let i = 2; i < messages.length - 1; i++) {
-      if (messages[i].role === "tool" && messages[i].content && messages[i].content.length > 300) {
-        messages[i].content = messages[i].content.slice(0, 300) + "\n... [Pruned to stay within TPM token limits]";
+      if (messages[i].role === "tool" && messages[i].content && messages[i].content.length > 200) {
+        messages[i].content = messages[i].content.slice(0, 200) + "\n... [Pruned]";
         totalLength = messages.reduce(
           (sum, m) => sum + (typeof m.content === "string" ? m.content.length : 0),
           0
