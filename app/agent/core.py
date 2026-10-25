@@ -1,13 +1,15 @@
 """Agentic Loop Controller orchestrating Diagnosis, Tool Calling, Sandbox Validation, and PR Delivery."""
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+import httpx
 
 from app.agent.prompts import DIAGNOSIS_USER_TEMPLATE, SRE_SYSTEM_PROMPT
 from app.agent.tools import WorkspaceTools
 from app.config import get_settings
-from app.models.schema import AgentStepEnum, RemediationResult
+from app.models.schema import RemediationResult
 from app.services.github_client import GitHubClient
 from app.services.sandbox import DockerSandbox, WorkspaceManager
 from app.services.security import SecretScanner
@@ -16,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class AgenticLoopController:
-    """Finite State Machine / Controller managing autonomous remediation iterations."""
+    """Finite State Machine / Controller managing autonomous remediation iterations with Gemini or Groq."""
 
     def __init__(
         self,
@@ -57,7 +59,7 @@ class AgenticLoopController:
                 job_id=job_id,
                 repo_url=clone_url,
                 ref=head_branch,
-                auth_token=self.settings.github_token,
+                auth_token=self.github_client.get_token(),
             )
 
             # Create fix branch
@@ -94,7 +96,7 @@ class AgenticLoopController:
                     modified_files=list(tools.modified_files),
                 )
 
-            # 3. Secret Scanning Pass
+            # 3. Secret Scanning Pass (Gitleaks / Regex scanner)
             diff_content = self.workspace_manager.get_git_diff(workspace_path)
             if self.settings.enable_secret_scanning:
                 scan_res = SecretScanner.scan_diff(diff_content)
@@ -117,7 +119,8 @@ class AgenticLoopController:
 
             # 5. Push branch and open PR
             pr_url = None
-            if self.settings.github_token:
+            token = self.github_client.get_token()
+            if token:
                 try:
                     self.workspace_manager.push_branch(workspace_path, fix_branch_name)
 
@@ -181,10 +184,28 @@ class AgenticLoopController:
         error_log_window: str,
         tools: WorkspaceTools,
     ) -> tuple[bool, int, str]:
-        """
-        Runs the LLM agent tool-calling loop with Gemini 2.5 Flash.
-        Falls back to safe iterative repair if API key is not configured.
-        """
+        """Route to active LLM Provider (Google AI Studio Gemini 2.5 Flash or Groq Cloud Llama 3.3)."""
+        provider = self.settings.llm_provider.lower()
+        if provider == "groq" or (self.settings.groq_api_key and not self.settings.gemini_api_key):
+            return await self._execute_groq_loop(
+                run_id, job_id, repo_full_name, head_branch, step_name, error_log_window, tools
+            )
+        else:
+            return await self._execute_gemini_loop(
+                run_id, job_id, repo_full_name, head_branch, step_name, error_log_window, tools
+            )
+
+    async def _execute_gemini_loop(
+        self,
+        run_id: int,
+        job_id: int,
+        repo_full_name: str,
+        head_branch: str,
+        step_name: str,
+        error_log_window: str,
+        tools: WorkspaceTools,
+    ) -> tuple[bool, int, str]:
+        """Runs the LLM agent tool-calling loop with Google Gemini 2.5 Flash."""
         max_retries = self.settings.max_retry_iterations
         api_key = self.settings.gemini_api_key
 
@@ -198,13 +219,15 @@ class AgenticLoopController:
 
             client = genai.Client(api_key=api_key)
 
-            # Available tool functions
             tool_functions: List[Callable] = [
                 tools.list_directory,
                 tools.read_workspace_file,
                 tools.write_workspace_file,
                 tools.patch_workspace_file,
                 tools.execute_sandbox_command,
+                tools.read_repo_file,
+                tools.apply_code_patch,
+                tools.run_sandbox_command,
             ]
 
             initial_files = tools.list_directory(".")
@@ -218,7 +241,6 @@ class AgenticLoopController:
                 workspace_files=initial_files,
             )
 
-            # Create chat session with tool definitions
             chat = client.chats.create(
                 model=self.settings.gemini_model,
                 config=types.GenerateContentConfig(
@@ -232,20 +254,17 @@ class AgenticLoopController:
             iteration = 0
             root_cause = "Autonomous remediation completed and verified."
 
-            # State loop with max iterations
             while iteration < max_retries:
                 iteration += 1
-                logger.info("Executing remediation iteration %d/%d", iteration, max_retries)
+                logger.info("Executing Gemini remediation iteration %d/%d", iteration, max_retries)
 
                 response = chat.send_message(current_message)
                 root_cause = response.text or root_cause
 
-                # Check if sandbox command was executed and succeeded
                 if tools.last_test_result and tools.last_test_result.exit_code == 0:
                     logger.info("Sandbox verification test passed on iteration %d!", iteration)
                     return True, iteration, root_cause
 
-                # If test failed or was executed with non-zero exit code, provide feedback
                 if tools.last_test_result and tools.last_test_result.exit_code != 0:
                     current_message = (
                         f"Validation command '{tools.last_test_command}' failed with exit code "
@@ -255,13 +274,195 @@ class AgenticLoopController:
                         "Please adjust your patch and re-verify in the sandbox."
                     )
                 else:
-                    # Model finished talking without running verification
                     break
 
-            # If loop finished and last test passed
             success = bool(tools.last_test_result and tools.last_test_result.exit_code == 0)
             return success, iteration, root_cause
 
         except Exception as e:
-            logger.error("LLM Agent execution encountered error: %s", e)
-            return False, 1, f"Agent execution exception: {str(e)}"
+            logger.error("Gemini Agent execution error: %s", e)
+            return False, 1, f"Gemini agent execution exception: {str(e)}"
+
+    async def _execute_groq_loop(
+        self,
+        run_id: int,
+        job_id: int,
+        repo_full_name: str,
+        head_branch: str,
+        step_name: str,
+        error_log_window: str,
+        tools: WorkspaceTools,
+    ) -> tuple[bool, int, str]:
+        """Runs the LLM agent tool-calling loop with Groq Cloud (Llama 3.3 70B)."""
+        max_retries = self.settings.max_retry_iterations
+        api_key = self.settings.groq_api_key
+
+        if not api_key:
+            logger.warning("GROQ_API_KEY is not set.")
+            return False, 1, "Groq API key not configured."
+
+        # Groq OpenAI-compatible Tool Specifications
+        groq_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_repo_file",
+                    "description": "Read file contents relative to repository root.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "apply_code_patch",
+                    "description": "Replace an exact block of code with new content.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "old_code": {"type": "string"},
+                            "new_code": {"type": "string"},
+                        },
+                        "required": ["path", "old_code", "new_code"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_workspace_file",
+                    "description": "Write or create a file with full content.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["file_path", "content"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_directory",
+                    "description": "List files and directories in repository.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "directory_path": {"type": "string", "default": "."}
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_sandbox_command",
+                    "description": "Run test or build command in safe sandbox.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            },
+        ]
+
+        initial_files = tools.list_directory(".")
+        user_prompt = DIAGNOSIS_USER_TEMPLATE.format(
+            branch=head_branch,
+            repo=repo_full_name,
+            job_id=job_id,
+            run_id=run_id,
+            step_name=step_name,
+            log_snippet=error_log_window,
+            workspace_files=initial_files,
+        )
+
+        messages = [
+            {"role": "system", "content": SRE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        iteration = 0
+        root_cause = "Autonomous remediation completed via Groq Llama 3.3."
+
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            while iteration < max_retries:
+                iteration += 1
+                logger.info("Executing Groq remediation iteration %d/%d", iteration, max_retries)
+
+                payload = {
+                    "model": self.settings.groq_model,
+                    "messages": messages,
+                    "tools": groq_tools,
+                    "tool_choice": "auto",
+                    "temperature": 0.1,
+                }
+
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                if resp.status_code != 200:
+                    logger.error("Groq API error: HTTP %d - %s", resp.status_code, resp.text)
+                    return False, iteration, f"Groq API error: {resp.text}"
+
+                data = resp.json()
+                choice = data["choices"][0]
+                msg = choice["message"]
+                messages.append(msg)
+
+                tool_calls = msg.get("tool_calls")
+                if not tool_calls:
+                    root_cause = msg.get("content") or root_cause
+                    break
+
+                for tc in tool_calls:
+                    fn_name = tc["function"]["name"]
+                    fn_args = json.loads(tc["function"]["arguments"] or "{}")
+                    call_id = tc["id"]
+
+                    res_content = ""
+                    if fn_name in {"read_repo_file", "read_workspace_file"}:
+                        path = fn_args.get("path") or fn_args.get("file_path", "")
+                        res_content = tools.read_workspace_file(path)
+                    elif fn_name in {"apply_code_patch", "patch_workspace_file"}:
+                        path = fn_args.get("path") or fn_args.get("file_path", "")
+                        old_s = fn_args.get("old_code") or fn_args.get("old_str", "")
+                        new_s = fn_args.get("new_code") or fn_args.get("new_str", "")
+                        res_content = tools.patch_workspace_file(path, old_s, new_s)
+                    elif fn_name == "write_workspace_file":
+                        res_content = tools.write_workspace_file(
+                            fn_args.get("file_path", ""), fn_args.get("content", "")
+                        )
+                    elif fn_name == "list_directory":
+                        res_content = tools.list_directory(fn_args.get("directory_path", "."))
+                    elif fn_name in {"run_sandbox_command", "execute_sandbox_command"}:
+                        cmd = fn_args.get("cmd") or fn_args.get("command", "")
+                        res_content = tools.execute_sandbox_command(cmd)
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": fn_name,
+                        "content": res_content,
+                    })
+
+                if tools.last_test_result and tools.last_test_result.exit_code == 0:
+                    logger.info("Sandbox test passed on Groq iteration %d!", iteration)
+                    return True, iteration, root_cause
+
+        success = bool(tools.last_test_result and tools.last_test_result.exit_code == 0)
+        return success, iteration, root_cause

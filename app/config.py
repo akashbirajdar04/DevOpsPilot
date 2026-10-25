@@ -27,12 +27,30 @@ class Settings(BaseSettings):
     github_webhook_secret: str = Field(
         default="", description="Secret key configured for webhook HMAC verification"
     )
+    github_app_id: Optional[str] = Field(default=None, description="GitHub App ID")
+    github_app_private_key: Optional[str] = Field(
+        default=None, description="GitHub App Private Key (.pem raw content)"
+    )
+    github_app_private_key_path: Optional[str] = Field(
+        default=None, description="Path to GitHub App Private Key (.pem file)"
+    )
+    github_app_installation_id: Optional[int] = Field(
+        default=None, description="GitHub App Installation ID"
+    )
 
-    # LLM Settings (Google GenAI / Gemini API)
+    # LLM Settings (Google AI Studio & Groq Cloud)
+    llm_provider: str = Field(
+        default="gemini", description="Active LLM provider: 'gemini' or 'groq'"
+    )
     gemini_api_key: str = Field(default="", description="Google Gemini API Key")
     gemini_model: str = Field(
         default="gemini-2.5-flash",
         description="Gemini model identifier (e.g. gemini-2.5-flash)",
+    )
+    groq_api_key: str = Field(default="", description="Groq Cloud API Key")
+    groq_model: str = Field(
+        default="llama-3.3-70b-versatile",
+        description="Groq model identifier (e.g. llama-3.3-70b-versatile)",
     )
 
     # Workspace & Sandboxing

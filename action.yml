@@ -1,0 +1,51 @@
+name: "DevOpsPilot Self-Healing CI Remediation"
+description: "Autonomous AI-powered self-healing agent that diagnoses CI test/build failures and opens verified fix PRs."
+author: "DevOpsPilot"
+branding:
+  icon: "tool"
+  color: "green"
+
+inputs:
+  gemini_api_key:
+    description: "Google AI Studio API key for Gemini 2.5 Flash"
+    required: false
+    default: ""
+  groq_api_key:
+    description: "Groq Cloud API key for Llama 3.3 70B"
+    required: false
+    default: ""
+  github_token:
+    description: "GitHub Token for opening PRs and pushing branches (e.g. secrets.GITHUB_TOKEN)"
+    required: true
+  max_retries:
+    description: "Maximum retry repair iterations"
+    required: false
+    default: "3"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install DevOpsPilot Dependencies
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install fastapi uvicorn pydantic pydantic-settings google-genai PyGithub httpx docker GitPython python-dotenv pyjwt cryptography
+
+    - name: Execute DevOpsPilot Autonomous Remediation
+      shell: bash
+      env:
+        GEMINI_API_KEY: ${{ inputs.gemini_api_key }}
+        GROQ_API_KEY: ${{ inputs.groq_api_key }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        MAX_RETRY_ITERATIONS: ${{ inputs.max_retries }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_REF_NAME: ${{ github.ref_name }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
+        GITHUB_JOB: ${{ github.job }}
+      run: |
+        python -m app.scripts.action_runner

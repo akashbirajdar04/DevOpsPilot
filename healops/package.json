@@ -1,0 +1,30 @@
+{
+  "name": "healops",
+  "version": "1.0.0",
+  "description": "Autonomous Self-Healing CI/CD GitHub App Agent powered by Gemini 2.5 Flash",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "probot run ./index.js",
+    "test": "node --test tests/**/*.test.js"
+  },
+  "keywords": [
+    "github-app",
+    "probot",
+    "ci-cd",
+    "self-healing",
+    "gemini",
+    "devops",
+    "sre"
+  ],
+  "author": "HealOps",
+  "license": "MIT",
+  "dependencies": {
+    "@google/genai": "^2.31.0",
+    "adm-zip": "^0.5.16",
+    "dotenv": "^16.4.7",
+    "execa": "^9.5.2",
+    "probot": "^13.4.1",
+    "strip-ansi": "^7.1.0"
+  }
+}

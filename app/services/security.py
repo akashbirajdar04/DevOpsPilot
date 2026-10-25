@@ -1,8 +1,16 @@
-"""Pre-commit secret scanning and redaction engine for generated patches."""
+"""Pre-commit secret scanning and redaction engine (Gitleaks CLI & regex heuristics)."""
 
+import json
+import logging
 import re
-from typing import Dict, List
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Optional
 from app.models.schema import SecretScanResult
+
+logger = logging.getLogger(__name__)
 
 # Common high-risk secret signatures (Gitleaks / TruffleHog patterns)
 SECRET_PATTERNS: Dict[str, re.Pattern] = {
@@ -28,23 +36,76 @@ SECRET_PATTERNS: Dict[str, re.Pattern] = {
 
 
 class SecretScanner:
-    """Scans code diffs and files to prevent secret leakage in automated remediation PRs."""
+    """Scans code diffs and workspaces to prevent secret leakage in automated remediation PRs."""
+
+    @classmethod
+    def is_gitleaks_available(cls) -> bool:
+        """Check if Gitleaks CLI binary is installed and reachable in system PATH."""
+        return shutil.which("gitleaks") is not None
+
+    @classmethod
+    def scan_with_gitleaks_cli(cls, diff_content: str) -> Optional[List[str]]:
+        """
+        Run official Gitleaks CLI against the patch stream if binary is installed.
+        Returns list of detected violation descriptions, or None if CLI failed/unavailable.
+        """
+        if not cls.is_gitleaks_available() or not diff_content.strip():
+            return None
+
+        try:
+            with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False) as report_file:
+                report_path = report_file.name
+
+            proc = subprocess.run(
+                ["gitleaks", "detect", "--no-git", "--pipe", f"--report-path={report_path}"],
+                input=diff_content,
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+
+            violations: List[str] = []
+            report = Path(report_path)
+            if report.exists() and report.stat().st_size > 0:
+                try:
+                    findings = json.loads(report.read_text(encoding="utf-8"))
+                    for f in findings:
+                        rule = f.get("RuleID") or f.get("Description") or "Secret"
+                        file_name = f.get("File", "patch")
+                        violations.append(f"Gitleaks: {rule} detected in {file_name}")
+                except Exception:
+                    pass
+                report.unlink(missing_ok=True)
+
+            # Exit code 1 in gitleaks means leaks were detected
+            if proc.returncode != 0 and not violations:
+                violations.append("Gitleaks detected secret patterns in diff stream.")
+
+            return violations
+
+        except Exception as e:
+            logger.warning("Gitleaks CLI execution encountered error: %s", e)
+            return None
 
     @classmethod
     def scan_diff(cls, diff_content: str) -> SecretScanResult:
         """
         Scans added lines in a patch or full file content for potential secrets.
-        Returns SecretScanResult indicating if the patch is safe.
+        Uses Gitleaks CLI if available, combined with high-precision regex signatures.
         """
         if not diff_content:
             return SecretScanResult(passed=True, detected_violations=[])
 
         violations: List[str] = []
-        lines = diff_content.splitlines()
 
+        # 1. Try Gitleaks CLI if present
+        cli_violations = cls.scan_with_gitleaks_cli(diff_content)
+        if cli_violations is not None:
+            violations.extend(cli_violations)
+
+        # 2. Built-in Regex scanner pass
+        lines = diff_content.splitlines()
         for line_num, line in enumerate(lines, 1):
-            # If scanning a unified diff, only check lines being added (+)
-            # Skip diff metadata lines like +++ or ---
             is_addition = line.startswith("+") and not line.startswith("+++")
             content_to_check = line[1:] if is_addition else line
 

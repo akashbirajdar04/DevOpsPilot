@@ -86,3 +86,23 @@ def test_execute_sandbox_command(temp_workspace):
     assert "Agent tool test passed" in data["stdout"]
     assert tools.last_test_result is not None
     assert tools.last_test_result.exit_code == 0
+
+
+def test_specification_tool_aliases(temp_workspace):
+    """Verify specification aliases: read_repo_file, apply_code_patch, run_sandbox_command."""
+    tools = WorkspaceTools(workspace_path=temp_workspace)
+
+    # 1. read_repo_file
+    content = tools.read_repo_file("src/index.js")
+    assert "hello world" in content
+
+    # 2. apply_code_patch
+    patch_res = tools.apply_code_patch("src/index.js", "hello world", "hello prompt specs")
+    assert "Successfully replaced" in patch_res
+    assert "hello prompt specs" in tools.read_repo_file("src/index.js")
+
+    # 3. run_sandbox_command
+    sandbox_res = tools.run_sandbox_command('python -c "print(\'Alias execution success\')"')
+    data = json.loads(sandbox_res)
+    assert data["exit_code"] == 0
+    assert "Alias execution success" in data["stdout"]

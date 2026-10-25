@@ -135,3 +135,19 @@ class WorkspaceTools:
             "duration_seconds": result.execution_time_seconds,
         }
         return json.dumps(output, indent=2)
+
+    # --------------------------------------------------------------------------
+    # Explicit Aliases matching Specification:
+    # read_repo_file, apply_code_patch, run_sandbox_command
+    # --------------------------------------------------------------------------
+    def read_repo_file(self, path: str) -> str:
+        """Read repository file content relative to workspace root."""
+        return self.read_workspace_file(file_path=path)
+
+    def apply_code_patch(self, path: str, old_code: str, new_code: str) -> str:
+        """Apply surgical code patch replacing old_code with new_code."""
+        return self.patch_workspace_file(file_path=path, old_str=old_code, new_str=new_code)
+
+    def run_sandbox_command(self, cmd: str) -> str:
+        """Run build, test, or verification command inside ephemeral sandbox."""
+        return self.execute_sandbox_command(command=cmd)
