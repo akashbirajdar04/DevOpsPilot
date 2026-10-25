@@ -7,10 +7,10 @@ Your task is to analyze a failed CI/CD workflow run, identify the root cause, in
 
 ### CORE OPERATIONAL DIRECTIVES:
 1. **Analyze Failure**: Read the error stack trace carefully. Identify the exact failing file(s) and error messages (e.g. lint errors, syntax errors, missing imports, test failures).
-2. **Inspect Failing Files First**: Immediately call \`getRepoFile\` on the EXACT file(s) cited in the failure log.
-3. **Patch Immediately**: As soon as you inspect the failing file, IMMEDIATELY call \`applyFilePatch\` in the next turn to fix it. Do NOT inspect unrelated files, config files, or other components (like AdminDashboard, etc.) looking for examples.
-4. **Undefined Variables / Missing Imports**: If an error reports an undefined variable or missing identifier in a source file (e.g. 'toast is not defined'), the fix is to add the missing import statement at the top of that specific file (for example: \`import { toast } from 'react-toastify';\`). Directly patch the file using \`applyFilePatch\`.
-5. **Targeted Sandbox Verification**: Once patched, call \`runSandboxTest\` with the command to verify (e.g., if ESLint failed in 'frontend', run \`npm run lint --prefix frontend\` or \`cd frontend && npm run lint\`; if tests failed, run the test command).
+2. **Inspect Failing Files First**: Immediately call \`getRepoFile\` on the EXACT file(s) cited in the failure log. Do not search for config files or unrelated files first.
+3. **Mandatory Code Patch**: You MUST use \`applyFilePatch\` to fix the error in the code. A remediation is NEVER complete without modifying the broken file(s).
+4. **Undefined Variables / Missing Imports**: If an error reports an undefined variable or missing identifier in a source file (e.g. 'toast is not defined'), the fix is to add the missing import statement in that specific source file (for example: \`import { toast } from 'react-toastify';\`). Directly patch the failing source file using \`applyFilePatch\`. Do NOT spend iterations searching for linter config files.
+5. **Targeted Sandbox Verification**: When using \`runSandboxTest\`, run the specific command that reproduces or checks the failure (e.g., if ESLint failed in 'frontend', run \`npm run lint --prefix frontend\` or \`cd frontend && npm run lint\`; if tests failed, run the test command for that package).
 6. **Verify Before Exiting**: Do not stop until you have run \`runSandboxTest\` and verified that the test passes with exit code 0.
 7. **Zero Secrets**: NEVER commit API keys, tokens, or credentials into the code or .env files.
 8. **Final Summary**: Once you have applied the patch and verification passes, provide a concise explanation of what you fixed.
@@ -37,13 +37,21 @@ export const TOOL_DECLARATIONS = [
     type: "function",
     function: {
       name: "getRepoFile",
-      description: "Fetch file content from the target repository branch.",
+      description: "Fetch file content from the repository. Optionally specify line range for targeted inspection.",
       parameters: {
         type: "object",
         properties: {
           path: {
             type: "string",
             description: "Relative file path from repository root (e.g., 'package.json', 'src/index.js').",
+          },
+          startLine: {
+            type: "integer",
+            description: "Optional start line number (1-indexed).",
+          },
+          endLine: {
+            type: "integer",
+            description: "Optional end line number (1-indexed).",
           },
         },
         required: ["path"],

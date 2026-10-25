@@ -59,12 +59,15 @@ export class AgentTools {
   /**
    * Fetch file content from the local workspace or remote GitHub branch.
    * @param {string} filePath - Relative file path
+   * @param {number} [startLine] - Optional start line (1-indexed)
+   * @param {number} [endLine] - Optional end line (1-indexed)
    * @returns {Promise<string>}
    */
-  async getRepoFile(filePath) {
+  async getRepoFile(filePath, startLine, endLine) {
     // 1. Check if recently modified in memory
     if (this.modifiedFiles.has(filePath)) {
-      return this.modifiedFiles.get(filePath);
+      const memoryContent = this.modifiedFiles.get(filePath);
+      return this._sliceFileLines(memoryContent, startLine, endLine);
     }
 
     let rawContent = "";
@@ -94,13 +97,29 @@ export class AgentTools {
     }
 
     if (!rawContent) return `Error: File '${filePath}' is empty or not found.`;
-    if (rawContent.length > 2500) {
+    return this._sliceFileLines(rawContent, startLine, endLine);
+  }
+
+  /**
+   * Slice lines or cap content to prevent TPM limit exhaustion.
+   */
+  _sliceFileLines(content, startLine, endLine) {
+    const lines = content.split("\n");
+    if (startLine || endLine) {
+      const start = Math.max(1, parseInt(startLine, 10) || 1);
+      const end = Math.min(lines.length, parseInt(endLine, 10) || lines.length);
+      const slice = lines.slice(start - 1, end);
+      return slice.map((l, idx) => `${start + idx}: ${l}`).join("\n");
+    }
+
+    // Default: Cap to first 70 lines or 2,500 characters
+    if (lines.length > 70 || content.length > 2500) {
       return (
-        rawContent.slice(0, 2500) +
-        `\n\n... [Truncated: File content capped at first 2,500 characters to stay within TPM token limits]`
+        lines.slice(0, 60).join("\n") +
+        `\n\n... [Truncated to stay within Groq TPM limit. Showing lines 1-60 of ${lines.length}. Specify startLine/endLine to view specific sections.]`
       );
     }
-    return rawContent;
+    return content;
   }
 
   /**

@@ -45,7 +45,7 @@ export class DiagnoserAgent {
       case "listFiles":
         return await this.tools.listFiles(args.directory || "");
       case "getRepoFile":
-        return await this.tools.getRepoFile(args.path);
+        return await this.tools.getRepoFile(args.path, args.startLine, args.endLine);
       case "applyFilePatch":
         return await this.tools.applyFilePatch(args.path, args.newContent);
       case "runSandboxTest":
@@ -61,9 +61,10 @@ export class DiagnoserAgent {
    * @param {string} context.errorLogSnippet - ANSI-cleaned error log window
    * @param {string} context.branch - Failing head branch name
    * @param {string} [context.stepName]
+   * @param {Array<{ file: string, line?: number, column?: number, message?: string }>} [context.targets]
    * @returns {Promise<{ success: boolean, iterations: number, rootCause: string, modifiedFiles: string[], testCommand: string, testOutput: string }>}
    */
-  async runRemediation({ errorLogSnippet, branch, stepName = "Build / Test" }) {
+  async runRemediation({ errorLogSnippet, branch, stepName = "Build / Test", targets = [] }) {
     if (!this.groq) {
       this.logger.warn("GROQ_API_KEY is not set. Cannot run Groq diagnostic loop.");
       return {
@@ -76,10 +77,23 @@ export class DiagnoserAgent {
       };
     }
 
+    let targetHeader = "";
+    if (targets && targets.length > 0) {
+      targetHeader =
+        "\n### 🎯 EXACT TARGETED FAILURE LOCATION IDENTIFIED:\n" +
+        targets
+          .map(
+            (t) =>
+              `- File: \`${t.file}\`${t.line ? ` (Line ${t.line})` : ""}${t.message ? `: ${t.message}` : ""}`
+          )
+          .join("\n") +
+        "\n\n👉 Inspect this exact file first and apply your fix using applyFilePatch!\n";
+    }
+
     const initialPrompt = `CI/CD Failure Report on branch '${branch}'.
 Failing Step: ${stepName}
-
-### Extracted Failure Log:
+${targetHeader}
+### Targeted Failure Log Fragment:
 \`\`\`text
 ${errorLogSnippet}
 \`\`\`
@@ -100,10 +114,10 @@ ${errorLogSnippet}
       iteration++;
       this.logger.info(`[Groq (${this.model})] Starting remediation iteration ${iteration}/${this.maxRetries}...`);
 
-      this._pruneGroqMessages(messages, 5000);
+      this._pruneGroqMessages(messages, 12000);
 
       let completion;
-      let delay = 10000;
+      let delay = 4000;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
           completion = await this.groq.chat.completions.create({
@@ -140,9 +154,9 @@ ${errorLogSnippet}
             this.logger.warn(
               `[Groq] TPM limit reached. Pruning context and waiting ${delay / 1000}s (Attempt ${attempt}/3)...`
             );
-            this._pruneGroqMessages(messages, 2500);
+            this._pruneGroqMessages(messages, 6000);
             await new Promise((r) => setTimeout(r, delay));
-            delay += 5000;
+            delay *= 1.5;
           } else {
             throw groqErr;
           }
@@ -216,7 +230,7 @@ ${errorLogSnippet}
   /**
    * Prune earlier tool messages to stay strictly within Groq's 8,000 TPM limit.
    */
-  _pruneGroqMessages(messages, maxChars = 5000) {
+  _pruneGroqMessages(messages, maxChars = 12000) {
     let totalLength = messages.reduce(
       (sum, m) => sum + (typeof m.content === "string" ? m.content.length : 0),
       0
@@ -224,8 +238,8 @@ ${errorLogSnippet}
     if (totalLength <= maxChars) return;
 
     for (let i = 2; i < messages.length - 1; i++) {
-      if (messages[i].role === "tool" && messages[i].content && messages[i].content.length > 200) {
-        messages[i].content = messages[i].content.slice(0, 200) + "\n... [Pruned]";
+      if (messages[i].role === "tool" && messages[i].content && messages[i].content.length > 300) {
+        messages[i].content = messages[i].content.slice(0, 300) + "\n... [Pruned to stay within TPM token limits]";
         totalLength = messages.reduce(
           (sum, m) => sum + (typeof m.content === "string" ? m.content.length : 0),
           0

@@ -57,15 +57,52 @@ export function extractRawLogText(rawLogBuffer) {
 }
 
 /**
- * Parse raw log, strip ANSI escapes, and extract the 150-line failure window.
- * @param {string | Buffer} rawLog
- * @param {number} [maxLines=150]
- * @returns {{ cleanLog: string, extractedWindow: string, totalLines: number, errorCount: number }}
+ * Extract targeted error addresses (file, line, col, message) from log text.
+ * @param {string} cleanLog
+ * @returns {Array<{ file: string, line?: number, column?: number, message?: string }>}
  */
-export function parseLog(rawLog, maxLines = 150) {
+export function extractFailureTargets(cleanLog) {
+  const lines = cleanLog.split("\n");
+  const targets = [];
+  for (let i = 0; i < lines.length; i++) {
+    // 1. ESLint / compiler / typescript style: file path followed by line:col error
+    const fileMatch = lines[i].match(/(?:[a-zA-Z0-9_\-\.]+[/\\])+[a-zA-Z0-9_\-\.]+\.(?:jsx?|tsx?|vue|py|go|rs|json|ya?ml)/);
+    if (fileMatch) {
+      let relPath = fileMatch[0].replace(/^.*[/\\]work[/\\][^/\\]+[/\\][^/\\]+[/\\]/, "");
+      relPath = relPath.replace(/^[/\\]+/, "");
+      const nextLine = lines[i + 1] || "";
+      const lineCol = nextLine.match(/^\s*(\d+):(\d+)\s+(?:error|warning)?\s*(.*)$/);
+      if (lineCol) {
+        targets.push({
+          file: relPath,
+          line: parseInt(lineCol[1], 10),
+          column: parseInt(lineCol[2], 10),
+          message: lineCol[3].trim(),
+        });
+        continue;
+      }
+    }
+    // 2. Jest / test runner: FAIL path/to/file
+    const failMatch = lines[i].match(/\b(?:FAIL|FAILED)\s+([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)/i);
+    if (failMatch) {
+      const nextFew = lines.slice(i + 1, i + 5).map((l) => l.trim()).filter(Boolean).join(" ");
+      targets.push({ file: failMatch[1], message: nextFew });
+    }
+  }
+  return targets;
+}
+
+/**
+ * Parse raw log, strip ANSI escapes, and extract a targeted failure window.
+ * @param {string | Buffer} rawLog
+ * @param {number} [maxLines=45]
+ * @returns {{ cleanLog: string, extractedWindow: string, totalLines: number, errorCount: number, detectedTargets: Array<{ file: string, line?: number, column?: number, message?: string }> }}
+ */
+export function parseLog(rawLog, maxLines = 45) {
   const rawText = extractRawLogText(rawLog);
   const cleanLog = stripAnsi(rawText).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const lines = cleanLog.split("\n").map((l) => l.trimEnd()).filter(Boolean);
+  const detectedTargets = extractFailureTargets(cleanLog);
 
   if (lines.length <= maxLines) {
     return {
@@ -73,6 +110,7 @@ export function parseLog(rawLog, maxLines = 150) {
       extractedWindow: lines.join("\n"),
       totalLines: lines.length,
       errorCount: lines.filter((l) => ERROR_PATTERNS.some((p) => p.test(l))).length,
+      detectedTargets,
     };
   }
 
@@ -85,19 +123,19 @@ export function parseLog(rawLog, maxLines = 150) {
   });
 
   if (errorIndices.length === 0) {
-    // If no explicit error keyword matches, return the tail of the log
     const window = lines.slice(-maxLines);
     return {
       cleanLog,
       extractedWindow: window.join("\n"),
       totalLines: lines.length,
       errorCount: 0,
+      detectedTargets,
     };
   }
 
   // Center window around the last major failure
   const lastErrorIdx = errorIndices[errorIndices.length - 1];
-  const beforeCount = Math.floor(maxLines * 0.7);
+  const beforeCount = Math.floor(maxLines * 0.4);
   const afterCount = maxLines - beforeCount;
 
   let startIdx = Math.max(0, lastErrorIdx - beforeCount);
@@ -114,5 +152,6 @@ export function parseLog(rawLog, maxLines = 150) {
     extractedWindow: selectedLines.join("\n"),
     totalLines: lines.length,
     errorCount: errorIndices.length,
+    detectedTargets,
   };
 }

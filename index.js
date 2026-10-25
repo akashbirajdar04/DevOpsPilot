@@ -81,8 +81,10 @@ export default function healOpsApp(app) {
       }
     }
 
-    const { extractedWindow, totalLines } = parseLog(rawLogBuffer || "CI Workflow Job Failed with exit code 1.");
-    app.log.info(`Parsed logs: Extracted focused failure window from ${totalLines} total lines.`);
+    const { extractedWindow, totalLines, detectedTargets } = parseLog(rawLogBuffer || "CI Workflow Job Failed with exit code 1.", 45);
+    app.log.info(
+      `Parsed logs: Extracted focused failure window (${extractedWindow.split("\n").length} lines, ${detectedTargets?.length || 0} target addresses) from ${totalLines} total lines.`
+    );
 
     // -------------------------------------------------------------------------
     // Step 2: Set up Ephemeral Sandbox and Agent Tools
@@ -129,6 +131,7 @@ export default function healOpsApp(app) {
         errorLogSnippet: extractedWindow,
         branch: headBranch,
         stepName: workflow_run.name || "CI Tests",
+        targets: detectedTargets,
       });
 
       if (tools.modifiedFiles.size === 0) {
