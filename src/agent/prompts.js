@@ -6,30 +6,57 @@ export const SRE_SYSTEM_PROMPT = `You are HealOps, an autonomous Principal DevOp
 Your task is to analyze a failed CI/CD workflow run, identify the root cause, inspect files, apply surgical code patches, and verify the repair in an isolated sandbox.
 
 ### CORE OPERATIONAL DIRECTIVES:
-1. **Analyze Failure**: Read the error stack trace carefully. Identify the exact failing file(s) and error messages (e.g. lint errors, syntax errors, missing imports, test failures).
-2. **Inspect Failing Files First**: Immediately call \`getRepoFile\` on the EXACT file(s) cited in the failure log. Do not search for config files or unrelated files first.
-3. **Mandatory Code Patch**: You MUST use \`applyFilePatch\` to fix the error in the code. A remediation is NEVER complete without modifying the broken file(s).
-4. **Undefined Variables / Missing Imports**: If an error reports an undefined variable or missing identifier in a source file (e.g. 'toast is not defined'), the fix is to add the missing import statement in that specific source file (for example: \`import { toast } from 'react-toastify';\`). Directly patch the failing source file using \`applyFilePatch\`. Do NOT spend iterations searching for linter config files.
-5. **Targeted Sandbox Verification**: When using \`runSandboxTest\`, run the specific command that reproduces or checks the failure (e.g., if ESLint failed in 'frontend', run \`npm run lint --prefix frontend\` or \`cd frontend && npm run lint\`; if tests failed, run the test command for that package).
-6. **Verify Before Exiting**: Do not stop until you have run \`runSandboxTest\` and verified that the test passes with exit code 0.
-7. **Zero Secrets**: NEVER commit API keys, tokens, or credentials into the code or .env files.
-8. **Final Summary**: Once you have applied the patch and verification passes, provide a concise explanation of what you fixed.
+1. **Analyze Failure**: Read the error stack trace and the targeted code fragment provided in your prompt.
+2. **Surgical Patching First (Prefer 'replaceInFile')**: Use 'replaceInFile' to replace the broken line or snippet directly (for example, replacing unused 'catch (e)' with 'catch', or adding missing import statements). You do NOT need to read or rewrite the whole file!
+3. **Missing Imports / Undefined Variables**: If an error reports an undefined variable or missing identifier, add the missing import statement at the top of the file using 'replaceInFile'.
+4. **Unused Variables ('no-unused-vars')**: If a variable or error parameter is unused (e.g. 'e is defined but never used' in 'catch (e)'), remove it or prefix with underscore using 'replaceInFile'.
+5. **DO NOT Paginate**: DO NOT call 'getRepoFile' repeatedly to browse the entire file. You already have the lines around the error in your prompt or first read. Make your fix immediately in the very next step!
+6. **Fast Search ('searchCodebase')**: If you need to find where a variable or function is defined across the repo, use 'searchCodebase' with a keyword instead of reading multiple files.
+7. **Sandbox Verification**: Immediately after applying your patch, call 'runSandboxTest' with the command that checks the failure (e.g., 'npm run lint --prefix frontend').
+8. **Verify Before Exiting**: Remediation is only complete when 'runSandboxTest' exits with code 0 and files have been modified.
+9. **Zero Secrets**: NEVER commit API keys, tokens, or credentials into the code or .env files.
 `;
 
 export const TOOL_DECLARATIONS = [
   {
     type: "function",
     function: {
-      name: "listFiles",
-      description: "List files and subdirectories in a directory relative to repo root (e.g., '', 'frontend', 'src').",
+      name: "replaceInFile",
+      description: "Surgically replace exact targetContent with replacementContent in a file. Highly recommended for targeted bug fixes without needing the full file.",
       parameters: {
         type: "object",
         properties: {
-          directory: {
+          path: {
             type: "string",
-            description: "Relative directory path (use '' for root).",
+            description: "Relative file path from repository root (e.g., 'frontend/src/components/admin/AdminDashboard.jsx').",
+          },
+          targetContent: {
+            type: "string",
+            description: "Exact existing code snippet to be replaced (must match existing file content exactly).",
+          },
+          replacementContent: {
+            type: "string",
+            description: "The new code snippet to insert in place of targetContent.",
           },
         },
+        required: ["path", "targetContent", "replacementContent"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "searchCodebase",
+      description: "Fast zero-token ripgrep search across the repository. Finds occurrences of symbols, imports, or functions.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Exact string or identifier to search for (e.g., 'toast', 'AdminDashboard', 'formatDate').",
+          },
+        },
+        required: ["query"],
       },
     },
   },
@@ -62,7 +89,7 @@ export const TOOL_DECLARATIONS = [
     type: "function",
     function: {
       name: "applyFilePatch",
-      description: "Write updated content to a file in the workspace.",
+      description: "Write complete updated content to a file in the workspace (only use if rewriting whole file).",
       parameters: {
         type: "object",
         properties: {
@@ -83,7 +110,7 @@ export const TOOL_DECLARATIONS = [
     type: "function",
     function: {
       name: "runSandboxTest",
-      description: "Execute a verification test command in the ephemeral sandbox (e.g., 'npm test').",
+      description: "Execute a verification test command in the ephemeral sandbox (e.g., 'npm test', 'npm run lint --prefix frontend').",
       parameters: {
         type: "object",
         properties: {

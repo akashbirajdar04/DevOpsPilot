@@ -4,6 +4,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import { execa } from "execa";
 
 export class AgentTools {
   /**
@@ -120,6 +121,54 @@ export class AgentTools {
       );
     }
     return content;
+  }
+
+  /**
+   * Surgically replace targetContent with replacementContent in a file.
+   * @param {string} filePath - Relative file path
+   * @param {string} targetContent - Exact text to replace
+   * @param {string} replacementContent - New text to insert
+   * @returns {Promise<string>}
+   */
+  async replaceInFile(filePath, targetContent, replacementContent) {
+    try {
+      const localPath = this._resolveSafePath(filePath);
+      let content = "";
+      if (this.modifiedFiles.has(filePath)) {
+        content = this.modifiedFiles.get(filePath);
+      } else {
+        content = await fs.readFile(localPath, "utf-8");
+      }
+
+      if (!content.includes(targetContent)) {
+        return `Error: targetContent was not found in '${filePath}'. Make sure the target text matches existing code exactly.`;
+      }
+
+      const updated = content.replace(targetContent, replacementContent);
+      await fs.mkdir(path.dirname(localPath), { recursive: true });
+      await fs.writeFile(localPath, updated, "utf-8");
+
+      this.modifiedFiles.set(filePath, updated);
+      return `Successfully replaced targeted content in '${filePath}'.`;
+    } catch (err) {
+      return `Error replacing content in '${filePath}': ${err.message}`;
+    }
+  }
+
+  /**
+   * Fast git grep search across the codebase.
+   * @param {string} query - Symbol or string to search for
+   * @returns {Promise<string>}
+   */
+  async searchCodebase(query) {
+    try {
+      const { stdout } = await execa("git", ["grep", "-n", "-I", "--max-count=15", query], {
+        cwd: this.workspaceDir,
+      });
+      return stdout.slice(0, 1000) || `No matches found for '${query}'.`;
+    } catch {
+      return `No matches found for '${query}'.`;
+    }
   }
 
   /**

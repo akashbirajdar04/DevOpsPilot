@@ -44,8 +44,15 @@ export class DiagnoserAgent {
     switch (name) {
       case "listFiles":
         return await this.tools.listFiles(args.directory || "");
-      case "getRepoFile":
-        return await this.tools.getRepoFile(args.path, args.startLine, args.endLine);
+      case "getRepoFile": {
+        const start = args.startLine ?? args.line_start ?? args.start ?? args.from;
+        const end = args.endLine ?? args.line_end ?? args.end ?? args.to;
+        return await this.tools.getRepoFile(args.path, start, end);
+      }
+      case "searchCodebase":
+        return await this.tools.searchCodebase(args.query);
+      case "replaceInFile":
+        return await this.tools.replaceInFile(args.path, args.targetContent, args.replacementContent);
       case "applyFilePatch":
         return await this.tools.applyFilePatch(args.path, args.newContent);
       case "runSandboxTest":
