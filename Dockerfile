@@ -1,34 +1,26 @@
 # syntax=docker/dockerfile:1
-FROM python:3.11-slim AS base
+FROM node:20-alpine AS base
 
-# Prevent Python from writing .pyc files and enable unbuffered logging
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
+# Install system dependencies (git for GitOps checkouts)
+RUN apk add --no-cache git curl
 
 WORKDIR /app
 
-# Install system dependencies (Git is required for workspace checkouts, curl for health checks)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Copy package descriptors
+COPY package*.json ./
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+# Install production dependencies
+RUN npm ci --omit=dev
 
-# Copy application source code
-COPY app/ ./app
-COPY .env.example ./.env.example
+# Copy application code
+COPY . .
 
-# Create isolated workspace mount directory
-RUN mkdir -p /app/workspaces
+ENV NODE_ENV=production \
+    PORT=3000
 
-EXPOSE 8000
+EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:3000/probot || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["npm", "start"]

@@ -1,147 +1,126 @@
-# 🚀 DevOpsPilot: Self-Healing CI/CD Autonomous Agent
+# 🩺 HealOps: Autonomous Self-Healing CI/CD GitHub App Agent
 
-**DevOpsPilot** is an autonomous self-healing CI/CD agent designed to ingest GitHub Actions webhook failure events, strip and parse noisy terminal logs down to the root cause, isolate repositories in safe workspaces, execute iterative repair loops powered by Google GenAI (Gemini 2.5 Flash), validate patches inside ephemeral sandboxes, and automatically open verified GitHub Pull Requests.
+**HealOps** is an autonomous GitHub App agent built with **Probot** and powered by **Google Gemini 2.5 Flash**. It automatically intercepts failed GitHub Actions workflow runs, downloads and sanitizes terminal logs, investigates codebases via an agentic function-calling loop, tests patches inside an ephemeral sandbox, and opens verified Pull Requests.
 
 ---
 
-## 🏗️ Architecture Overview
+## 🏗️ Architecture & Component Flow
 
 ```text
-+----------------------------------------+
-| GitHub Actions Pipeline / Webhook Emit |
-+-------------------+--------------------+
-                    |
-       HTTP POST    | (Event: workflow_job.completed && failure)
-                    v
-+---------------------------------------------------------------------------------------+
-|  Auto-Remediation Service (FastAPI Daemon)                                            |
-|                                                                                       |
-|  +-----------------------+      +---------------------+      +---------------------+  |
-|  | Webhook Ingestion     | ---> | Log Ingestion &     | ---> | Repository Context  |  |
-|  | - HMAC verification   |      | Noise Pruning       |      | Cloner              |  |
-|  | - Event de-duplication|      | - ANSI strip / Tail |      | - Git worktree sync |  |
-|  +-----------------------+      +---------------------+      +----------+----------+  |
-|                                                                         |             |
-|  +--------------------------------------------------------------------+ |             |
-|  | LLM Agentic Remediation Engine (Gemini 2.5 Flash / Function Calling) | v             |
-|  |                                                                                    |
-|  |   +-------------------+         +---------------------+                            |
-|  |   | Diagnosis Module  | <-----> | Tool Registry       |                            |
-|  |   | (Gemini 2.5 Flash)|         | - read_file         |                            |
-|  |   +---------+---------+         | - apply_patch       |                            |
-|  |             |                   | - run_sandbox_build |                            |
-|  |             v                   +----------+----------+                            |
-|  |   [Is Fix Verified?]                       |                                       |
-|  |       |               \                    v                                       |
-|  |     Yes                No (Retry <= 3) -> Ephemeral Docker Sandbox                 |
-|  |       |                                                                            |
-|  |       v                                                                            |
-|  |   +------------------------------------+                                           |
-|  |   | Git Patch & PR Delivery Engine     |                                           |
-|  |   | - Gitleaks Secret Redaction        |                                           |
-|  |   | - Push to fix/ci-<run-id> branch   |                                           |
-|  |   | - Open GitHub Pull Request via API |                                           |
-|  |   +------------------------------------+                                           |
-+---------------------------------------------------------------------------------------+
+[ GitHub Actions Workflow Failure ]
+               │
+               ▼ (Webhook: workflow_run.completed && failure)
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Event Router & Safety Guard (index.js)                   │
+│    - Verifies Probot webhook signatures                     │
+│    - Anti-loop Guard: Skips branches starting with fix/ci- │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Log Cleaner (src/services/logParser.js)                  │
+│    - Strips ANSI sequences with strip-ansi                  │
+│    - Extracts focused 150-line failure zone                 │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Gemini 2.5 Flash Autonomous ReAct Loop                   │
+│    (src/agent/diagnoser.js & src/agent/tools.js)            │
+│                                                             │
+│    Tools:                                                   │
+│    - getRepoFile(path)                                      │
+│    - applyFilePatch(path, newContent)                       │
+│    - runSandboxTest(command)                                │
+│                                                             │
+│    [Max 3 Retries on Sandbox Failure]                       │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼ (Tests Pass: exitCode === 0)
+┌─────────────────────────────────────────────────────────────┐
+│ 4. Pre-Commit Security Guardrail (src/utils/secretGuard.js) │
+│    - Blocks AWS keys, GitHub tokens, passwords, and .env    │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 5. GitOps Delivery (src/services/gitOps.js)                 │
+│    - Creates fix/ci-failure-<run_id> branch                 │
+│    - Commits patched files                                  │
+│    - Opens verified Pull Request with test evidence         │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 📁 Repository Structure
+## 📁 Directory Structure
 
 ```text
-DevOpsPilot/
-├── app/
-│   ├── __init__.py
-│   ├── main.py                  # FastAPI entrypoint, logging, and health checks
-│   ├── config.py                # Pydantic Settings configuration
-│   ├── api/
-│   │   ├── __init__.py
-│   │   └── webhook.py           # Webhook receiver with HMAC and loop guards
-│   ├── services/
-│   │   ├── github_client.py     # GitHub REST API: logs download & PR delivery
-│   │   ├── log_parser.py        # ANSI code stripper & failure window extractor
-│   │   ├── sandbox.py           # Workspace manager & Docker sandbox runner
-│   │   └── security.py          # Pre-commit secret scanning engine (Gitleaks)
+healops/
+├── package.json              # Node.js 20+ ESM manifest
+├── .env.example              # Environment variables template
+├── README.md                 # Documentation and operational runbook
+├── index.js                  # Probot app entry point and event router
+├── src/
 │   ├── agent/
-│   │   ├── __init__.py
-│   │   ├── core.py              # Agentic loop finite state machine
-│   │   ├── prompts.py           # SRE root-cause diagnosis system prompts
-│   │   └── tools.py             # Tool implementations with sandbox safety
-│   └── models/
-│       ├── __init__.py
-│       └── schema.py            # Pydantic schemas for events, tools, and PRs
-├── tests/
-│   ├── test_log_parser.py       # Log parsing & ANSI cleaner tests
-│   ├── test_security.py         # Secret scanner tests
-│   ├── test_sandbox.py          # Sandbox & workspace tests
-│   ├── test_agent.py            # Agent tools & security tests
-│   ├── test_webhook.py          # Webhook HMAC and filter tests
-│   └── test_e2e_remediation.py  # Full end-to-end self-healing simulation test
-├── Dockerfile                   # Container definition
-├── requirements.txt             # Pinned project dependencies
-├── .env.example                 # Template environment variables
-├── PROGRESS.md                  # Milestone progress tracking
-└── PROBLEMS_FACED.md            # Technical challenges & solutions log
+│   │   ├── diagnoser.js      # Gemini LLM function-calling agent loop
+│   │   ├── prompts.js        # SRE system prompts and tool schemas
+│   │   └── tools.js          # Agent tools (getRepoFile, applyFilePatch, runSandboxTest)
+│   ├── services/
+│   │   ├── logParser.js      # ANSI stripper and error tail extractor
+│   │   ├── sandbox.js        # Ephemeral runner with execa
+│   │   └── gitOps.js         # Branch creation, file commit, and PR opener via Octokit
+│   └── utils/
+│       └── secretGuard.js    # Pre-commit regex scanner for leaked secrets
+└── tests/
+    └── agent.test.js         # Integration & unit test suite
 ```
 
 ---
 
-## ⚡ Quick Start
+## 🚀 Getting Started
 
-### 1. Environment Configuration
-Clone the repository and set up your `.env` file:
+### 1. Installation
+
+```bash
+cd healops
+npm install
+```
+
+### 2. Configure Environment
+
+Copy `.env.example` to `.env`:
 
 ```bash
 cp .env.example .env
 ```
 
-Configure your credentials in `.env`:
-- `GITHUB_TOKEN`: GitHub Personal Access Token (with `repo` permissions).
-- `GITHUB_WEBHOOK_SECRET`: Secret key configured on your GitHub Webhook.
-- `GEMINI_API_KEY`: Google Gemini API key.
+Fill in your configuration:
+- `APP_ID`: Your GitHub App ID.
+- `PRIVATE_KEY`: Your GitHub App `.pem` private key string.
+- `WEBHOOK_SECRET`: Webhook secret configured on GitHub.
+- `GEMINI_API_KEY`: Google AI Studio API key.
 
-### 2. Local Setup & Virtual Environment
-
-```bash
-# Create virtual environment
-python -m venv .venv
-
-# Activate virtual environment (Windows PowerShell)
-.venv\Scripts\Activate.ps1
-# On Linux/macOS: source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### 3. Run the Development Server
+### 3. Run the GitHub App
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+npm start
 ```
 
-Visit the interactive OpenAPI documentation at: `http://localhost:8000/docs`.
+Probot will launch a local server and provide an automatic Smee.io tunnel URL for testing webhooks directly without manual port forwarding.
 
 ---
 
-## 🧪 Running Tests
+## 🧪 Testing
 
-DevOpsPilot features 100% passing unit, integration, and E2E simulation tests:
+Run the automated test suite:
 
 ```bash
-pytest -v
+npm test
 ```
 
----
-
-## 🛡️ Guardrails & Safety Mechanisms
-
-1. **Anti-Infinite Loop Guard**:
-   Events triggered by branches matching `fix/ci-*` or `fix/remediation-*` are immediately rejected with an HTTP 202 to avoid recursive CI self-healing triggers.
-2. **Pre-Commit Secret Scanning**:
-   Before creating git commits or opening PRs, all patches pass through `SecretScanner` to intercept AWS keys, GitHub tokens, private keys, or credentials.
-3. **Sandbox Directory Traversal Prevention**:
-   All agent file read/write operations strictly enforce boundary checks (`_resolve_safe_path`), blocking directory escape (`../../`).
-4. **Retry Budget**:
-   A strict hard ceiling of 3 iterative repair attempts per job prevents runaway LLM execution.
+### Tests Covered:
+1. **Secret Scanning**: Verifies AWS keys, GitHub tokens, and `.env` files are blocked from automated commits.
+2. **Log Sanitization**: Verifies ANSI escape sequences are stripped and the 150-line failure tail is correctly extracted.
+3. **Workspace Tools**: Verifies file reads, writes, patches, and sandboxed command execution.
+4. **Integration Simulation**: Simulates a project with a failing build, exercises the ReAct tool-calling loop, fixes the code, validates the repair in the sandbox, and ensures the patch passes secret scanning.
