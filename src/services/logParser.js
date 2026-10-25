@@ -155,3 +155,60 @@ export function parseLog(rawLog, maxLines = 45) {
     detectedTargets,
   };
 }
+
+/**
+ * Extract culprit file location and line number using stack trace regex.
+ * @param {string} logText
+ * @returns {{ targetFile: string, lineNum: number } | null}
+ */
+export function extractCulpritLocation(logText) {
+  if (!logText) return null;
+
+  // 1. Check for standard path/to/file.ext:line(:col) format
+  const directMatch = logText.match(/([a-zA-Z0-9_\-./\\]+\.(?:jsx?|tsx?|py|json|vue|go|rs)):(\d+)/i);
+  if (directMatch) {
+    let file = directMatch[1]
+      .replace(/^.*[/\\]work[/\\][^/\\]+[/\\][^/\\]+[/\\]/, "")
+      .replace(/^.*workspace[/\\]/, "")
+      .replace(/^[/\\]+/, "");
+    return { targetFile: file, lineNum: parseInt(directMatch[2], 10) };
+  }
+
+  // 2. Check for ESLint / multi-line format
+  const lines = logText.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const fileMatch = lines[i].match(/(?:[a-zA-Z0-9_\-\.]+[/\\])+[a-zA-Z0-9_\-\.]+\.(?:jsx?|tsx?|vue|py|go|rs|json)/);
+    if (fileMatch) {
+      let relPath = fileMatch[0]
+        .replace(/^.*[/\\]work[/\\][^/\\]+[/\\][^/\\]+[/\\]/, "")
+        .replace(/^.*workspace[/\\]/, "")
+        .replace(/^[/\\]+/, "");
+      const nextLine = lines[i + 1] || "";
+      const lineCol = nextLine.match(/^\s*(\d+):(\d+)/);
+      if (lineCol) {
+        return { targetFile: relPath, lineNum: parseInt(lineCol[1], 10) };
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Return only a targeted window of lines centered around lineNum (lineNum - windowSize to lineNum + windowSize).
+ * @param {string} fileContent - Entire file text
+ * @param {number} lineNum - Offending line number (1-indexed)
+ * @param {number} [windowSize=15] - Lines before and after (default 15 = 30 lines total)
+ * @returns {string} Numbered line window snippet
+ */
+export function getLineWindow(fileContent, lineNum, windowSize = 15) {
+  if (!fileContent || typeof fileContent !== "string") return "";
+  const lines = fileContent.split("\n");
+  const num = parseInt(lineNum, 10);
+  if (!num || isNaN(num)) {
+    return lines.slice(0, windowSize * 2).map((l, idx) => `${idx + 1}: ${l}`).join("\n");
+  }
+  const start = Math.max(0, num - windowSize - 1);
+  const end = Math.min(lines.length, num + windowSize);
+  return lines.slice(start, end).map((l, idx) => `${start + idx + 1}: ${l}`).join("\n");
+}

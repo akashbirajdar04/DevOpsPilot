@@ -9,7 +9,7 @@ import path from "node:path";
 import os from "node:os";
 
 import { scanContentForSecrets } from "../src/utils/secretGuard.js";
-import { parseLog } from "../src/services/logParser.js";
+import { parseLog, extractCulpritLocation, getLineWindow } from "../src/services/logParser.js";
 import { Sandbox } from "../src/services/sandbox.js";
 import { AgentTools } from "../src/agent/tools.js";
 import { DiagnoserAgent } from "../src/agent/diagnoser.js";
@@ -48,6 +48,26 @@ test("logParser: strips ANSI codes and extracts 150-line error tail", () => {
   assert.equal(parsed.cleanLog.includes("\x1B"), false);
   assert.equal(parsed.extractedWindow.includes("FAIL tests/unit.test.js"), true);
   assert.equal(parsed.extractedWindow.includes("Cannot find module 'lodash'"), true);
+});
+
+test("logParser: extractCulpritLocation and getLineWindow extracts targeted 30-line code window", () => {
+  const logSnippet = [
+    "/workspace/frontend/src/components/Profile.jsx:14:3",
+    "error: 'toast' is not defined no-undef",
+  ].join("\n");
+
+  const culprit = extractCulpritLocation(logSnippet);
+  assert.notEqual(culprit, null);
+  assert.equal(culprit.targetFile, "frontend/src/components/Profile.jsx");
+  assert.equal(culprit.lineNum, 14);
+
+  const sampleCode = Array.from({ length: 50 }, (_, i) => `const line_${i + 1} = true;`).join("\n");
+  const lineWindow = getLineWindow(sampleCode, 14, 5);
+  // Center around line 14: lines 9 to 19
+  assert.equal(lineWindow.includes("14: const line_14 = true;"), true);
+  assert.equal(lineWindow.includes("9: const line_9 = true;"), true);
+  assert.equal(lineWindow.includes("19: const line_19 = true;"), true);
+  assert.equal(lineWindow.includes("1: const line_1 = true;"), false);
 });
 
 test("AgentTools: read, patch, and execute sandboxed test commands", async () => {

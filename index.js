@@ -8,7 +8,7 @@ import { execa } from "execa";
 import { DiagnoserAgent } from "./src/agent/diagnoser.js";
 import { AgentTools } from "./src/agent/tools.js";
 import { GitOpsService } from "./src/services/gitOps.js";
-import { parseLog } from "./src/services/logParser.js";
+import { parseLog, extractCulpritLocation, getLineWindow } from "./src/services/logParser.js";
 import { Sandbox } from "./src/services/sandbox.js";
 
 /**
@@ -114,6 +114,30 @@ export default function healOpsApp(app) {
       ref: headBranch,
     });
 
+    // -------------------------------------------------------------------------
+    // Step 2b: Stack-Trace Targeted Extraction (Line Window: lineNum ± 15)
+    // -------------------------------------------------------------------------
+    const culprit = extractCulpritLocation(cleanLog);
+    let culpritContext = null;
+    if (culprit?.targetFile && culprit?.lineNum) {
+      try {
+        const fullContent = await tools.getRepoFile(culprit.targetFile);
+        if (fullContent && !fullContent.startsWith("Error:")) {
+          const lineWindow = getLineWindow(fullContent, culprit.lineNum, 15);
+          culpritContext = {
+            targetFile: culprit.targetFile,
+            lineNum: culprit.lineNum,
+            lineWindow,
+          };
+          app.log.info(
+            `Extracted targeted line window for '${culprit.targetFile}' centered at line ${culprit.lineNum} (window: 30 lines).`
+          );
+        }
+      } catch (err) {
+        app.log.warn(`Could not extract line window for culprit file: ${err.message}`);
+      }
+    }
+
     const agent = new DiagnoserAgent({
       tools,
       apiKey: process.env.GROQ_API_KEY,
@@ -132,6 +156,7 @@ export default function healOpsApp(app) {
         branch: headBranch,
         stepName: workflow_run.name || "CI Tests",
         targets: detectedTargets,
+        culprit: culpritContext,
       });
 
       if (tools.modifiedFiles.size === 0) {

@@ -64,7 +64,13 @@ export class DiagnoserAgent {
    * @param {Array<{ file: string, line?: number, column?: number, message?: string }>} [context.targets]
    * @returns {Promise<{ success: boolean, iterations: number, rootCause: string, modifiedFiles: string[], testCommand: string, testOutput: string }>}
    */
-  async runRemediation({ errorLogSnippet, branch, stepName = "Build / Test", targets = [] }) {
+  async runRemediation({
+    errorLogSnippet,
+    branch,
+    stepName = "Build / Test",
+    targets = [],
+    culprit = null,
+  }) {
     if (!this.groq) {
       this.logger.warn("GROQ_API_KEY is not set. Cannot run Groq diagnostic loop.");
       return {
@@ -90,15 +96,24 @@ export class DiagnoserAgent {
         "\n\n👉 Inspect this exact file first and apply your fix using applyFilePatch!\n";
     }
 
+    let culpritSection = "";
+    if (culprit && culprit.lineWindow) {
+      culpritSection =
+        `\n### 🎯 TARGETED SOURCE FILE FRAGMENT (\`${culprit.targetFile}\`, centered around line ${culprit.lineNum}):\n` +
+        `\`\`\`javascript\n${culprit.lineWindow}\n\`\`\`\n` +
+        `👉 The failure is located at line ${culprit.lineNum} of \`${culprit.targetFile}\` above. Call 'applyFilePatch' to fix this file immediately!\n`;
+    }
+
     const initialPrompt = `CI/CD Failure Report on branch '${branch}'.
 Failing Step: ${stepName}
 ${targetHeader}
+${culpritSection}
 ### Targeted Failure Log Fragment:
 \`\`\`text
 ${errorLogSnippet}
 \`\`\`
 
-1. Inspect the failing source file(s) and error locations identified above using 'getRepoFile'.
+1. Inspect the failing code fragment and error location identified above.
 2. Formulate and apply a surgical code repair using 'applyFilePatch'.
 3. Verify your fix passes by running 'runSandboxTest' with the appropriate test or lint command.`;
 
