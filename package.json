@@ -2,6 +2,8 @@
   "name": "healops",
   "version": "1.0.0",
   "description": "Autonomous Self-Healing CI/CD GitHub App Agent powered by Gemini 2.5 Flash",
+  "homepage": "https://github.com/",
+  "repository": "https://github.com/akashbirajdar04/DevOpsPilot",
   "type": "module",
   "main": "index.js",
   "scripts": {

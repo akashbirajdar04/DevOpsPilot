@@ -28,3 +28,13 @@ This document records technical hurdles, runtime nuances, and architectural deci
 * **Problem**: GitHub's `context.octokit.actions.downloadWorkflowRunLogs` returns a zip archive containing logs for all matrix jobs and workflow steps rather than a single text stream.
 * **Impact**: Passing a binary zip buffer directly to an LLM corrupts context and wastes tokens.
 * **Solution**: In `src/services/logParser.js`, added extraction logic to decompress the zip archive via `adm-zip` (or fall back to single job text), find the failing step log, strip ANSI escape sequences with `strip-ansi`, and isolate the 150 lines surrounding failure keywords (`FAIL`, `Error:`, `ModuleNotFoundError`, `Exit code 1`).
+
+---
+
+### Issue #4: Probot Manifest Setup Wizard Fails with 'Invalid GitHub App configuration'
+* **Problem**: Clicking 'Register a GitHub App' in Probot forwarded an incomplete manifest to GitHub (`https://github.com/settings/apps/new?manifest=...`), missing the mandatory `url` field and `default_permissions` / `default_events` specifications.
+* **Impact**: GitHub rejected the manifest registration with a red banner error: `Invalid GitHub App configuration`.
+* **Solution**:
+  1. Created [app.yml](file:///c:/DevOpsPilot/app.yml) in root defining the required `name`, `url`, `default_permissions` (`actions: read`, `checks: read`, `contents: write`, `pull_requests: write`), and `default_events` (`workflow_run`).
+  2. Added `"homepage"` and `"repository"` fields to [package.json](file:///c:/DevOpsPilot/package.json).
+  3. Restarting `npm start` and clicking 'Register a GitHub App' now passes all GitHub manifest validations.
