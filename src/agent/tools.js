@@ -5,6 +5,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { execa } from "execa";
+import { cleanRepoFilePath } from "../services/logParser.js";
 
 export class AgentTools {
   /**
@@ -33,7 +34,7 @@ export class AgentTools {
    * Ensure relative path stays strictly within the workspace directory.
    */
   _resolveSafePath(filePath) {
-    const cleanPath = filePath.replace(/^[/\\]+/, "");
+    const cleanPath = cleanRepoFilePath(filePath, this.repo);
     const resolved = path.resolve(this.workspaceDir, cleanPath);
     if (!resolved.startsWith(this.workspaceDir)) {
       throw new Error(`Security violation: Path '${filePath}' escapes workspace boundary.`);
@@ -59,68 +60,100 @@ export class AgentTools {
 
   /**
    * Fetch file content from the local workspace or remote GitHub branch.
-   * @param {string} filePath - Relative file path
-   * @param {number} [startLine] - Optional start line (1-indexed)
-   * @param {number} [endLine] - Optional end line (1-indexed)
+   * Returns a focused line window if targetLine is provided, capped at 1,800 characters.
+   *
+   * @param {object|string} params - { filePath, targetLine = null, window = 25 } or filePath string
+   * @param {number} [legacyStart]
+   * @param {number} [legacyEnd]
    * @returns {Promise<string>}
    */
-  async getRepoFile(filePath, startLine, endLine) {
-    // 1. Check if recently modified in memory
-    if (this.modifiedFiles.has(filePath)) {
-      const memoryContent = this.modifiedFiles.get(filePath);
-      return this._sliceFileLines(memoryContent, startLine, endLine);
+  async getRepoFile(params, legacyStart, legacyEnd) {
+    let filePath;
+    let targetLine = null;
+    let window = 25;
+
+    if (typeof params === "string") {
+      filePath = params;
+      if (typeof legacyStart === "number") targetLine = legacyStart;
+      if (typeof legacyEnd === "number") window = legacyEnd;
+    } else if (params && typeof params === "object") {
+      filePath = params.filePath || params.path;
+      targetLine = params.targetLine ?? params.line ?? null;
+      window = params.window ?? 25;
     }
 
+    if (!filePath) {
+      return "Error: filePath is required for getRepoFile.";
+    }
+
+    // 1. Check if recently modified in memory
     let rawContent = "";
-    // 2. Check local workspace filesystem
-    try {
-      const localPath = this._resolveSafePath(filePath);
-      rawContent = await fs.readFile(localPath, "utf-8");
-    } catch {
-      // 3. Fallback to remote Octokit getContent if available
-      if (this.octokit && this.owner && this.repo) {
-        try {
-          const { data } = await this.octokit.rest.repos.getContent({
-            owner: this.owner,
-            repo: this.repo,
-            path: filePath,
-            ref: this.ref,
-          });
-          if (!Array.isArray(data) && data.content) {
-            rawContent = Buffer.from(data.content, "base64").toString("utf-8");
+    if (this.modifiedFiles.has(filePath)) {
+      rawContent = this.modifiedFiles.get(filePath);
+    } else {
+      // 2. Check local workspace filesystem
+      try {
+        const localPath = this._resolveSafePath(filePath);
+        rawContent = await fs.readFile(localPath, "utf-8");
+      } catch {
+        // 3. Fallback to remote Octokit getContent if available
+        if (this.octokit && this.owner && this.repo) {
+          try {
+            const { data } = await this.octokit.rest.repos.getContent({
+              owner: this.owner,
+              repo: this.repo,
+              path: filePath,
+              ref: this.ref,
+            });
+            if (!Array.isArray(data) && data.content) {
+              rawContent = Buffer.from(data.content, "base64").toString("utf-8");
+            }
+          } catch (remoteErr) {
+            return `Error: Could not find file '${filePath}' remotely or locally: ${remoteErr.message}`;
           }
-        } catch (remoteErr) {
-          return `Error: Could not find file '${filePath}' remotely or locally: ${remoteErr.message}`;
+        } else {
+          return `Error: File '${filePath}' not found.`;
         }
-      } else {
-        return `Error: File '${filePath}' not found.`;
       }
     }
 
     if (!rawContent) return `Error: File '${filePath}' is empty or not found.`;
-    return this._sliceFileLines(rawContent, startLine, endLine);
+    return this._formatLineWindow(rawContent, targetLine, window);
   }
 
   /**
-   * Slice lines or cap content to prevent TPM limit exhaustion.
+   * Return only lines (targetLine - window) to (targetLine + window) with line numbers prepended.
+   * Capped to a hard limit of 1,800 characters (~450 tokens).
+   *
+   * @param {string} content - Raw file content
+   * @param {number|null} [targetLine=null] - Target center line
+   * @param {number} [window=25] - Lines before and after
+   * @returns {string}
    */
-  _sliceFileLines(content, startLine, endLine) {
+  _formatLineWindow(content, targetLine = null, window = 25) {
     const lines = content.split("\n");
-    if (startLine || endLine) {
-      const start = Math.max(1, parseInt(startLine, 10) || 1);
-      const end = Math.min(lines.length, parseInt(endLine, 10) || lines.length);
-      const slice = lines.slice(start - 1, end);
-      return slice.map((l, idx) => `${start + idx}: ${l}`).join("\n");
+    let output = "";
+
+    if (targetLine !== null && targetLine !== undefined && !isNaN(parseInt(targetLine, 10))) {
+      const target = parseInt(targetLine, 10);
+      const win = parseInt(window, 10) || 25;
+      const start = Math.max(1, target - win);
+      const end = Math.min(lines.length, target + win);
+      output = lines
+        .slice(start - 1, end)
+        .map((l, idx) => `${start + idx}: ${l}`)
+        .join("\n");
+    } else {
+      output = content;
     }
 
-    // Default: Cap to first 70 lines or 2,500 characters
-    if (lines.length > 70 || content.length > 2500) {
-      return (
-        lines.slice(0, 60).join("\n") +
-        `\n\n... [Truncated to stay within Groq TPM limit. Showing lines 1-60 of ${lines.length}. Specify startLine/endLine to view specific sections.]`
-      );
+    const HARD_LIMIT = 1800;
+    const TRUNCATION_NOTICE = "\n// [Remaining lines omitted to stay within token limits]";
+    if (output.length > HARD_LIMIT) {
+      output = output.slice(0, HARD_LIMIT) + TRUNCATION_NOTICE;
     }
-    return content;
+
+    return output;
   }
 
   /**

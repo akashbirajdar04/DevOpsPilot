@@ -1,6 +1,6 @@
 /**
  * HealOps: Autonomous Self-Healing CI/CD GitHub App Agent
- * Entry point and event routing via Probot.
+ * Single-Shot Deterministic Remediation Pipeline
  */
 
 import "dotenv/config";
@@ -8,14 +8,27 @@ import { execa } from "execa";
 import { DiagnoserAgent } from "./src/agent/diagnoser.js";
 import { AgentTools } from "./src/agent/tools.js";
 import { GitOpsService } from "./src/services/gitOps.js";
-import { parseLog, extractCulpritLocation, getLineWindow } from "./src/services/logParser.js";
+import { extractAllCulprits, extractCulpritLocation, extractFatalErrorLine, getLineWindow, extractRawLogText, cleanRepoFilePath } from "./src/services/logParser.js";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { Sandbox } from "./src/services/sandbox.js";
+
+// Store the server boot timestamp when the application starts
+export const serverBootTime = new Date();
 
 /**
  * @param {import("probot").Probot} app
+ * @param {Date|object} [optionsOrBootTime]
  */
-export default function healOpsApp(app) {
-  app.log.info("🤖 HealOps Self-Healing CI/CD Agent is initializing...");
+export default function healOpsApp(app, optionsOrBootTime) {
+  const bootTime =
+    optionsOrBootTime instanceof Date
+      ? optionsOrBootTime
+      : optionsOrBootTime?.bootTime instanceof Date
+      ? optionsOrBootTime.bootTime
+      : serverBootTime;
+
+  app.log.info(`🤖 HealOps Single-Shot Remediation Agent initializing (Boot: ${bootTime.toISOString()})...`);
 
   app.on("workflow_run.completed", async (context) => {
     const { workflow_run, repository } = context.payload;
@@ -25,12 +38,21 @@ export default function healOpsApp(app) {
     const owner = repository.owner.login;
     const repo = repository.name;
 
-    app.log.info(
-      `Received workflow_run.completed for ${owner}/${repo} (Run #${runId}, Branch: '${headBranch}', Conclusion: '${conclusion}')`
+    // -------------------------------------------------------------------------
+    // Guard 1: Drop Stale Replayed Runs from Smee.io
+    // -------------------------------------------------------------------------
+    const runCompletedAt = new Date(
+      workflow_run.updated_at || workflow_run.run_started_at || workflow_run.created_at
     );
+    if (runCompletedAt < bootTime) {
+      app.log.info(
+        `[STALE EVENT] Dropping replayed run from Smee.io (Run #${runId}, completed at ${runCompletedAt.toISOString()})`
+      );
+      return;
+    }
 
     // -------------------------------------------------------------------------
-    // Guard 1: Only handle genuine failures
+    // Guard 2: Only handle genuine failures
     // -------------------------------------------------------------------------
     if (conclusion !== "failure") {
       app.log.info(`Skipping non-failure run conclusion: '${conclusion}'`);
@@ -38,7 +60,7 @@ export default function healOpsApp(app) {
     }
 
     // -------------------------------------------------------------------------
-    // Guard 2: Anti-Infinite Recursion Loop Guard
+    // Guard 3: Anti-Infinite Recursion Loop Guard
     // -------------------------------------------------------------------------
     if (headBranch && headBranch.startsWith("fix/ci-")) {
       app.log.info(
@@ -47,8 +69,12 @@ export default function healOpsApp(app) {
       return;
     }
 
+    app.log.info(
+      `Received workflow_run.completed for ${owner}/${repo} (Run #${runId}, Branch: '${headBranch}', Conclusion: '${conclusion}')`
+    );
+
     // -------------------------------------------------------------------------
-    // Step 1: Download & Parse Workflow Logs
+    // Step 1: Download Workflow Run Logs
     // -------------------------------------------------------------------------
     let rawLogBuffer = "";
     try {
@@ -81,18 +107,37 @@ export default function healOpsApp(app) {
       }
     }
 
-    const { cleanLog, extractedWindow, totalLines, detectedTargets } = parseLog(rawLogBuffer || "CI Workflow Job Failed with exit code 1.", 45);
+    const logText = extractRawLogText(rawLogBuffer || "CI Workflow Job Failed with exit code 1.");
+
+    // -------------------------------------------------------------------------
+    // Step 2: Deterministic Culprit Extraction (single or multi-file)
+    // -------------------------------------------------------------------------
+    let culprits = extractAllCulprits(logText, repo);
+
+    if (!culprits || culprits.length === 0) {
+      const single = extractCulpritLocation(logText);
+      if (single?.targetFile) {
+        const cleanedFile = cleanRepoFilePath(single.targetFile, repo);
+        const fatalLine = extractFatalErrorLine(logText, cleanedFile);
+        culprits = [{ targetFile: cleanedFile, lineNum: single.lineNum, errors: [fatalLine] }];
+      }
+    }
+
+    if (!culprits || culprits.length === 0) {
+      app.log.warn(`No culprit files detected via regex in Run #${runId} logs. Exiting cleanly.`);
+      return;
+    }
+
     app.log.info(
-      `Parsed logs: Extracted focused failure window (${extractedWindow.split("\n").length} lines, ${detectedTargets?.length || 0} target addresses) from ${totalLines} total lines.`
+      `🎯 Detected ${culprits.length} broken file(s) across codebase:\n${culprits.map((c) => `  • ${c.targetFile} (line ${c.lineNum})`).join("\n")}`
     );
 
     // -------------------------------------------------------------------------
-    // Step 2: Set up Ephemeral Sandbox and Agent Tools
+    // Step 3: Set up Ephemeral Sandbox and Agent Tools
     // -------------------------------------------------------------------------
     const sandbox = new Sandbox();
     const workspaceDir = await sandbox.initWorkspace();
 
-    // Clone target repository branch into the ephemeral sandbox workspace using GitHub App installation token
     try {
       const auth = await context.octokit.auth({ type: "installation" });
       const cloneUrl = `https://x-access-token:${auth.token}@github.com/${owner}/${repo}.git`;
@@ -101,6 +146,22 @@ export default function healOpsApp(app) {
         cwd: workspaceDir,
         shell: true,
       });
+
+      // Install dependencies in sandbox if package.json exists
+      const targetSubDir = culprits[0]?.targetFile?.includes("/") ? culprits[0].targetFile.split("/")[0] : "";
+      const hasSubPkg = targetSubDir && (await fs.stat(path.join(workspaceDir, targetSubDir, "package.json")).catch(() => null));
+      const installCwd = hasSubPkg ? path.join(workspaceDir, targetSubDir) : workspaceDir;
+
+      try {
+        app.log.info(`Installing dependencies in sandbox (${installCwd})...`);
+        await execa(`npm ci --prefer-offline || npm install --prefer-offline`, {
+          cwd: installCwd,
+          shell: true,
+          timeout: 120000,
+        });
+      } catch (npmErr) {
+        app.log.warn(`Sandbox dependency install note: ${npmErr.message}`);
+      }
     } catch (cloneErr) {
       app.log.warn(`Could not clone repo into sandbox: ${cloneErr.message}. Falling back to remote Octokit fetching.`);
     }
@@ -115,64 +176,75 @@ export default function healOpsApp(app) {
     });
 
     // -------------------------------------------------------------------------
-    // Step 2b: Stack-Trace Targeted Extraction (Line Window: lineNum ± 15)
-    // -------------------------------------------------------------------------
-    const culprit = extractCulpritLocation(cleanLog);
-    let culpritContext = null;
-    if (culprit?.targetFile && culprit?.lineNum) {
-      try {
-        const fullContent = await tools.getRepoFile(culprit.targetFile);
-        if (fullContent && !fullContent.startsWith("Error:")) {
-          const lineWindow = getLineWindow(fullContent, culprit.lineNum, 15);
-          culpritContext = {
-            targetFile: culprit.targetFile,
-            lineNum: culprit.lineNum,
-            lineWindow,
-          };
-          app.log.info(
-            `Extracted targeted line window for '${culprit.targetFile}' centered at line ${culprit.lineNum} (window: 30 lines).`
-          );
-        }
-      } catch (err) {
-        app.log.warn(`Could not extract line window for culprit file: ${err.message}`);
-      }
-    }
-
-    const agent = new DiagnoserAgent({
-      tools,
-      apiKey: process.env.GROQ_API_KEY,
-      model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
-      maxRetries: parseInt(process.env.MAX_RETRY_ITERATIONS || "10", 10),
-      logger: app.log,
-    });
-
-    // -------------------------------------------------------------------------
-    // Step 3: Run Autonomous Groq ReAct Loop
+    // Step 4: Multi-File LLM Fixer & Workspace Verification
     // -------------------------------------------------------------------------
     try {
-      app.log.info(`Dispatching autonomous remediation agent for Run #${runId}...`);
-      const remediation = await agent.runRemediation({
-        errorLogSnippet: extractedWindow,
-        branch: headBranch,
-        stepName: workflow_run.name || "CI Tests",
-        targets: detectedTargets,
-        culprit: culpritContext,
+      const agent = new DiagnoserAgent({
+        tools,
+        apiKey: process.env.GROQ_API_KEY,
+        model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
+        logger: app.log,
       });
 
-      if (tools.modifiedFiles.size === 0) {
+      // Dynamically select verification command for sandbox
+      let testCommand = "npm test --if-present";
+      const primaryTargetFile = culprits[0].targetFile;
+      const targetSubDir = primaryTargetFile.includes("/") ? primaryTargetFile.split("/")[0] : "";
+      const rootPkgPath = path.join(workspaceDir, "package.json");
+      const subPkgPath = targetSubDir ? path.join(workspaceDir, targetSubDir, "package.json") : null;
+
+      try {
+        if (subPkgPath) {
+          const subPkgRaw = await fs.readFile(subPkgPath, "utf-8");
+          const subPkg = JSON.parse(subPkgRaw);
+          const cmds = [];
+          if (subPkg.scripts?.lint) cmds.push(`npm run lint --prefix ${targetSubDir}`);
+          if (subPkg.scripts?.test) cmds.push(`npm test --prefix ${targetSubDir}`);
+          if (subPkg.scripts?.build) cmds.push(`npm run build --prefix ${targetSubDir}`);
+          if (cmds.length > 0) {
+            testCommand = cmds.join(" && ");
+          } else {
+            testCommand = `npm test --if-present --prefix ${targetSubDir}`;
+          }
+        } else {
+          const rootPkgRaw = await fs.readFile(rootPkgPath, "utf-8");
+          const rootPkg = JSON.parse(rootPkgRaw);
+          const cmds = [];
+          if (rootPkg.scripts?.lint) cmds.push("npm run lint");
+          if (rootPkg.scripts?.test) cmds.push("npm test");
+          if (rootPkg.scripts?.build) cmds.push("npm run build");
+          if (cmds.length > 0) {
+            testCommand = cmds.join(" && ");
+          } else {
+            testCommand = "npm test --if-present";
+          }
+        }
+      } catch {
+        testCommand = "npm test --if-present";
+      }
+
+      app.log.info(`Dispatching deterministic remediation for Run #${runId} across ${culprits.length} file(s)...`);
+      const remediation = await agent.runMultiFileRemediation({
+        culprits,
+        testCommand,
+        delayMs: parseInt(process.env.GROQ_TURN_DELAY_MS || "2000", 10),
+      });
+
+      // -----------------------------------------------------------------------
+      // Step 5: PR Delivery (if verified) or Clean Exit (if unverified)
+      // -----------------------------------------------------------------------
+      if (!remediation.success) {
         app.log.warn(
-          `Remediation loop completed without generating any code patches. Skipping Pull Request creation.`
+          `Remediation was unsuccessful for Run #${runId}. Exiting cleanly without opening a PR.`
         );
         return;
       }
 
       app.log.info(
-        `Remediation completed! Modified files: ${Array.from(tools.modifiedFiles.keys()).join(", ")} (Sandbox pass: ${remediation.success})`
+        `🎉 Multi-file remediation passed! Pushing to fix/ci-failure-${runId} and opening PR with ${remediation.modifiedFiles.length} file(s)...`
       );
 
-      // -----------------------------------------------------------------------
-      // Step 4: GitOps - Branch, Commit, and Open PR
-      // -----------------------------------------------------------------------
+
       const gitOps = new GitOpsService(context.octokit, owner, repo);
       const fixBranch = await gitOps.createFixBranch(runId, headBranch);
 
@@ -180,7 +252,7 @@ export default function healOpsApp(app) {
       await gitOps.commitFiles(
         fixBranch,
         filesMap,
-        `fix(ci): autonomous remediation for run #${runId}\n\n${remediation.rootCause}`
+        `fix(ci): single-shot deterministic remediation for run #${runId}\n\n${remediation.rootCause}`
       );
 
       const prResult = await gitOps.openPullRequest({
@@ -191,12 +263,12 @@ export default function healOpsApp(app) {
         modifiedFiles: remediation.modifiedFiles,
         testCommand: remediation.testCommand,
         testOutput: remediation.testOutput,
-        iterations: remediation.iterations,
+        iterations: 1,
       });
 
       app.log.info(`🎉 Successfully opened Pull Request: ${prResult.prUrl} (#${prResult.prNumber})`);
-    } catch (remediationError) {
-      app.log.error(`Unhandled error during remediation: ${remediationError.message}`);
+    } catch (err) {
+      app.log.error(`Unhandled error during single-shot remediation: ${err.message}`);
     } finally {
       await sandbox.cleanup();
     }

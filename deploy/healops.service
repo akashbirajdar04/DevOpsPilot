@@ -1,0 +1,19 @@
+[Unit]
+Description=HealOps Autonomous Self-Healing CI/CD Agent
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/DevOpsPilot
+ExecStart=/usr/bin/npm start
+Restart=always
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=healops
+Environment=NODE_ENV=production
+EnvironmentFile=/home/ubuntu/DevOpsPilot/.env
+
+[Install]
+WantedBy=multi-user.target

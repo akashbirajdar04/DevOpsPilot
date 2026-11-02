@@ -199,4 +199,25 @@ export class GitOpsService {
 
     return { prUrl: pr.html_url, prNumber: pr.number };
   }
+
+  /**
+   * Leave an audit comment on a commit when remediation aborts.
+   * @param {string} commitSha
+   * @param {string} commentBody
+   * @returns {Promise<any>}
+   */
+  async createCommitComment(commitSha, commentBody) {
+    if (!commitSha || !this.octokit?.rest?.repos?.createCommitComment) return null;
+    try {
+      const response = await this.octokit.rest.repos.createCommitComment({
+        owner: this.owner,
+        repo: this.repo,
+        commit_sha: commitSha,
+        body: commentBody,
+      });
+      return response.data;
+    } catch (err) {
+      return null;
+    }
+  }
 }

@@ -1,24 +1,11 @@
 /**
- * Log processing service: strips ANSI escape sequences and extracts targeted error windows.
+ * Log processing service: strips ANSI escape sequences and extracts deterministic failure locations.
  */
 
 import stripAnsi from "strip-ansi";
 import AdmZip from "adm-zip";
 
-const ERROR_PATTERNS = [
-  /\bFAIL\b/i,
-  /\bFAILED\b/i,
-  /\bError:\b/i,
-  /\bAssertionError\b/i,
-  /\bModuleNotFoundError\b/i,
-  /\bTypeError\b/i,
-  /\bSyntaxError\b/i,
-  /\bCannot find module\b/i,
-  /\bExit code [1-9]\d*/i,
-  /\bProcess completed with exit code [1-9]\d*/i,
-  /\bERR!\b/i,
-  /\bBUILD FAILED\b/i,
-];
+export const CULPRIT_REGEX = /(?:[\w.-]+\/)*[\w.-]+\.(?:jsx?|tsx?|json|py):(\d+)/i;
 
 /**
  * Extract text from either a raw text string, an ArrayBuffer/Buffer (zip or text).
@@ -40,7 +27,6 @@ export function extractRawLogText(rawLogBuffer) {
       const zipEntries = zip.getEntries();
       const textParts = [];
 
-      // Find files that are log files
       for (const entry of zipEntries) {
         if (!entry.isDirectory && (entry.entryName.endsWith(".txt") || entry.entryName.endsWith(".log"))) {
           const content = zip.readAsText(entry);
@@ -57,42 +43,6 @@ export function extractRawLogText(rawLogBuffer) {
 }
 
 /**
- * Extract targeted error addresses (file, line, col, message) from log text.
- * @param {string} cleanLog
- * @returns {Array<{ file: string, line?: number, column?: number, message?: string }>}
- */
-export function extractFailureTargets(cleanLog) {
-  const lines = cleanLog.split("\n");
-  const targets = [];
-  for (let i = 0; i < lines.length; i++) {
-    // 1. ESLint / compiler / typescript style: file path followed by line:col error
-    const fileMatch = lines[i].match(/(?:[a-zA-Z0-9_\-\.]+[/\\])+[a-zA-Z0-9_\-\.]+\.(?:jsx?|tsx?|vue|py|go|rs|json|ya?ml)/);
-    if (fileMatch) {
-      let relPath = fileMatch[0].replace(/^.*[/\\]work[/\\][^/\\]+[/\\][^/\\]+[/\\]/, "");
-      relPath = relPath.replace(/^[/\\]+/, "");
-      const nextLine = lines[i + 1] || "";
-      const lineCol = nextLine.match(/^\s*(\d+):(\d+)\s+(?:error|warning)?\s*(.*)$/);
-      if (lineCol) {
-        targets.push({
-          file: relPath,
-          line: parseInt(lineCol[1], 10),
-          column: parseInt(lineCol[2], 10),
-          message: lineCol[3].trim(),
-        });
-        continue;
-      }
-    }
-    // 2. Jest / test runner: FAIL path/to/file
-    const failMatch = lines[i].match(/\b(?:FAIL|FAILED)\s+([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)/i);
-    if (failMatch) {
-      const nextFew = lines.slice(i + 1, i + 5).map((l) => l.trim()).filter(Boolean).join(" ");
-      targets.push({ file: failMatch[1], message: nextFew });
-    }
-  }
-  return targets;
-}
-
-/**
  * Strips GitHub Actions ISO timestamps and workflow annotations (##[error], etc.).
  * @param {string} raw
  * @returns {string}
@@ -105,107 +55,114 @@ export function cleanGHActionsLog(raw) {
 }
 
 /**
- * Parse raw log, strip ANSI escapes, and extract a targeted failure window.
- * @param {string | Buffer} rawLog
- * @param {number} [maxLines=45]
- * @returns {{ cleanLog: string, extractedWindow: string, totalLines: number, errorCount: number, detectedTargets: Array<{ file: string, line?: number, column?: number, message?: string }> }}
+ * Extract only the fatal error line matching FAIL, error:, or Error:
+ * @param {string} logText
+ * @returns {string}
  */
-export function parseLog(rawLog, maxLines = 45) {
-  const rawText = extractRawLogText(rawLog);
-  const unstripped = stripAnsi(rawText).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const cleanLog = cleanGHActionsLog(unstripped);
-  const lines = cleanLog.split("\n").map((l) => l.trimEnd()).filter(Boolean);
-  const detectedTargets = extractFailureTargets(cleanLog);
+export function extractFatalErrorLine(logText, targetFile = "") {
+  if (!logText) return "";
+  const cleaned = cleanGHActionsLog(stripAnsi(typeof logText === "string" ? logText : String(logText)));
+  const lines = cleaned.split("\n").map((l) => l.trim()).filter(Boolean);
 
-  if (lines.length <= maxLines) {
-    return {
-      cleanLog,
-      extractedWindow: lines.join("\n"),
-      totalLines: lines.length,
-      errorCount: lines.filter((l) => ERROR_PATTERNS.some((p) => p.test(l))).length,
-      detectedTargets,
-    };
-  }
+  // If a target file is known, collect up to 3 error lines under that specific file
+  if (targetFile) {
+    const baseName = targetFile.split("/").pop();
+    const fileErrors = [];
+    let inFileBlock = false;
 
-  // Find line indices, prioritizing specific linter/compiler/test failures over generic exit codes
-  const specificIndices = [];
-  const genericIndices = [];
-  lines.forEach((line, idx) => {
-    if (/\b(?:error|FAIL|FAILED|SyntaxError|TypeError|no-undef|no-unused-vars)\b/i.test(line)) {
-      specificIndices.push(idx);
-    } else if (ERROR_PATTERNS.some((p) => p.test(line))) {
-      genericIndices.push(idx);
+    for (const l of lines) {
+      if (l.includes(baseName)) {
+        inFileBlock = true;
+        continue;
+      }
+      if (inFileBlock) {
+        if (l.startsWith("/") || (l.includes("/") && !l.includes("error") && !l.includes("warning"))) {
+          break; // Entered next file block
+        }
+        if (/\berror\b/i.test(l) && !/Process completed with exit code/i.test(l)) {
+          fileErrors.push(l);
+        }
+      }
     }
+
+    if (fileErrors.length > 0) {
+      return fileErrors.slice(0, 3).join("\n");
+    }
+  }
+
+  const fatalLine = lines.find((l) => {
+    if (/Process completed with exit code/i.test(l)) return false;
+    if (/^===.*===$/.test(l)) return false;
+    return (
+      /\bFAIL\b/i.test(l) ||
+      /\berror\b/i.test(l) ||
+      /\bError\b/.test(l) ||
+      /\b(?:SyntaxError|TypeError|ReferenceError)\b/i.test(l)
+    );
   });
-
-  const errorIndices = specificIndices.length > 0 ? specificIndices : genericIndices;
-
-  if (errorIndices.length === 0) {
-    const window = lines.slice(-maxLines);
-    return {
-      cleanLog,
-      extractedWindow: window.join("\n"),
-      totalLines: lines.length,
-      errorCount: 0,
-      detectedTargets,
-    };
-  }
-
-  // Center window around the first specific error or last failure
-  const targetErrorIdx = specificIndices.length > 0 ? specificIndices[0] : errorIndices[errorIndices.length - 1];
-  const beforeCount = Math.floor(maxLines * 0.4);
-  const afterCount = maxLines - beforeCount;
-
-  let startIdx = Math.max(0, targetErrorIdx - beforeCount);
-  let endIdx = Math.min(lines.length, targetErrorIdx + afterCount);
-
-  if (endIdx - startIdx < maxLines) {
-    startIdx = Math.max(0, endIdx - maxLines);
-  }
-
-  const selectedLines = lines.slice(startIdx, endIdx);
-
-  return {
-    cleanLog,
-    extractedWindow: selectedLines.join("\n"),
-    totalLines: lines.length,
-    errorCount: errorIndices.length,
-    detectedTargets,
-  };
+  return fatalLine || lines[0] || "CI Build / Test Failure";
 }
 
 /**
- * Extract culprit file location and line number using stack trace regex.
+ * Sanitize file paths extracted from GitHub Actions runners or container logs.
+ * Strips /home/runner/work/:repo/:repo, D:/a/:repo/:repo, /workspace/, and duplicate repo folders.
+ * @param {string} rawPath
+ * @param {string} [repoName=""]
+ * @returns {string} Clean relative file path from repository root
+ */
+export function cleanRepoFilePath(rawPath, repoName = "") {
+  if (!rawPath) return "";
+  let clean = rawPath.replace(/\\/g, "/");
+  clean = clean.replace(/^.*\/work\/[^/]+\/[^/]+\//i, "");
+  clean = clean.replace(/^[a-zA-Z]:\/a\/[^/]+\/[^/]+\//i, "");
+  clean = clean.replace(/^.*(?:workspace)\//i, "");
+  clean = clean.replace(/^([a-zA-Z0-9_\-]+)\/\1\//i, "");
+  if (repoName) {
+    const repoPrefix = new RegExp("^" + repoName + "/", "i");
+    clean = clean.replace(repoPrefix, "");
+  }
+  return clean.replace(/^\/+/, "");
+}
+
+/**
+ * Extract culprit file location and line number using stack trace regex:
+ * /(?:[\w.-]+\/)*[\w.-]+\.(?:jsx?|tsx?|json|py):(\d+)/i
+ *
  * @param {string} logText
  * @returns {{ targetFile: string, lineNum: number } | null}
  */
 export function extractCulpritLocation(logText) {
   if (!logText) return null;
-  const cleaned = cleanGHActionsLog(logText);
+  const rawText = extractRawLogText(logText);
+  const cleaned = cleanGHActionsLog(stripAnsi(rawText));
+  const normalized = cleaned.replace(/\\/g, "/");
 
-  // 1. Check for standard path/to/file.ext:line(:col) format
-  const directMatch = cleaned.match(/([a-zA-Z0-9_\-./\\]+\.(?:jsx?|tsx?|py|json|vue|go|rs)):(\d+)/i);
-  if (directMatch) {
-    let file = directMatch[1]
-      .replace(/^.*[/\\]work[/\\][^/\\]+[/\\][^/\\]+[/\\]/, "")
-      .replace(/^.*workspace[/\\]/, "")
-      .replace(/^[/\\]+/, "");
-    return { targetFile: file, lineNum: parseInt(directMatch[2], 10) };
+  const match = normalized.match(CULPRIT_REGEX);
+  if (match) {
+    const rawPath = match[0].slice(0, match[0].lastIndexOf(":"));
+    const targetFile = cleanRepoFilePath(rawPath);
+    const lineNum = parseInt(match[1], 10);
+    return { targetFile, lineNum };
   }
 
-  // 2. Check for ESLint / multi-line format
-  const lines = cleaned.split("\n");
+  // Fallback for ESLint / Linter multi-line format:
+  // /path/to/file.ext
+  // [Error:]   10:15  error  'foo' is defined but never used
+  const lines = normalized.split("\n");
   for (let i = 0; i < lines.length; i++) {
-    const fileMatch = lines[i].match(/(?:[a-zA-Z0-9_\-\.]+[/\\])+[a-zA-Z0-9_\-\.]+\.(?:jsx?|tsx?|vue|py|go|rs|json)/);
-    if (fileMatch) {
-      let relPath = fileMatch[0]
-        .replace(/^.*[/\\]work[/\\][^/\\]+[/\\][^/\\]+[/\\]/, "")
-        .replace(/^.*workspace[/\\]/, "")
-        .replace(/^[/\\]+/, "");
-      const nextLine = lines[i + 1] || "";
-      const lineCol = nextLine.match(/^\s*(\d+):(\d+)/);
-      if (lineCol) {
-        return { targetFile: relPath, lineNum: parseInt(lineCol[1], 10) };
+    const line = lines[i].trim();
+    const fileMatch = line.match(/(?:[\w.-]+\/)*[\w.-]+\.(?:jsx?|tsx?|json|py)/i);
+    if (fileMatch && !line.includes(" error ") && !line.includes(" warning ")) {
+      const relPath = cleanRepoFilePath(fileMatch[0]);
+      for (let j = 1; j <= 10 && i + j < lines.length; j++) {
+        const subLine = lines[i + j];
+        if (!subLine || (!subLine.includes("error") && !subLine.includes("warning") && subLine.includes("/"))) {
+          break;
+        }
+        const lineCol = subLine.match(/(?:(?:Error|Warning|##\[\w+\]):\s*)?(\d+):(\d+)/i);
+        if (lineCol) {
+          return { targetFile: relPath, lineNum: parseInt(lineCol[1], 10) };
+        }
       }
     }
   }
@@ -214,11 +171,95 @@ export function extractCulpritLocation(logText) {
 }
 
 /**
- * Return only a targeted window of lines centered around lineNum (lineNum - windowSize to lineNum + windowSize).
+ * Extract all culprit files and their associated error lines from build logs.
+ * Supports stack traces, Jest, ESLint table formats, TypeScript, and Python logs.
+ *
+ * @param {string} logText
+ * @param {string} [repoName=""]
+ * @returns {Array<{ targetFile: string, lineNum: number, errors: string[] }>}
+ */
+export function extractAllCulprits(logText, repoName = "") {
+  if (!logText) return [];
+  const rawText = extractRawLogText(logText);
+  const cleaned = cleanGHActionsLog(stripAnsi(rawText));
+  const normalized = cleaned.replace(/\\/g, "/");
+  const lines = normalized.split("\n");
+  const culpritsMap = new Map();
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+
+    // 1. Single-line stack trace or compiler format: path/to/file.ext:10:15
+    const singleMatch = line.match(/(?:[\w.-]+\/)*[\w.-]+\.(?:jsx?|tsx?|json|py):(\d+)/i);
+    if (singleMatch && (/\berror\b/i.test(line) || /\bFAIL\b/i.test(line))) {
+      const rawPath = singleMatch[0].slice(0, singleMatch[0].lastIndexOf(":"));
+      const targetFile = cleanRepoFilePath(rawPath, repoName);
+      const lineNum = parseInt(singleMatch[1], 10);
+      if (!culpritsMap.has(targetFile)) {
+        culpritsMap.set(targetFile, { targetFile, lineNum, errors: [line] });
+      } else {
+        culpritsMap.get(targetFile).errors.push(line);
+      }
+      continue;
+    }
+
+    // 2. Multi-line ESLint / Linter table format
+    const fileMatch = line.match(/(?:[\w.-]+\/)*[\w.-]+\.(?:jsx?|tsx?|json|py)/i);
+    if (fileMatch && !line.includes(" error ") && !line.includes(" warning ")) {
+      const targetFile = cleanRepoFilePath(fileMatch[0], repoName);
+      let firstLineNum = null;
+      const errors = [];
+
+      for (let j = 1; j <= 25 && i + j < lines.length; j++) {
+        const subLine = lines[i + j].trim();
+        // End of file error block if next file header or empty
+        if (!subLine || (!subLine.includes("error") && !subLine.includes("warning") && subLine.includes("/"))) {
+          break;
+        }
+        if (/\berror\b/i.test(subLine) && !/Process completed with exit code/i.test(subLine)) {
+          errors.push(subLine);
+          if (firstLineNum === null) {
+            const lineCol = subLine.match(/(?:(?:Error|Warning|##\[\w+\]):\s*)?(\d+):(\d+)/i);
+            if (lineCol) firstLineNum = parseInt(lineCol[1], 10);
+          }
+        }
+      }
+
+      if (errors.length > 0) {
+        if (!culpritsMap.has(targetFile)) {
+          culpritsMap.set(targetFile, { targetFile, lineNum: firstLineNum || 1, errors });
+        } else {
+          culpritsMap.get(targetFile).errors.push(...errors);
+        }
+      }
+    }
+  }
+
+  // Fallback if no multi-line culprits were detected
+  if (culpritsMap.size === 0) {
+    const single = extractCulpritLocation(logText);
+    if (single) {
+      const fatal = extractFatalErrorLine(logText, single.targetFile);
+      culpritsMap.set(single.targetFile, {
+        targetFile: single.targetFile,
+        lineNum: single.lineNum,
+        errors: [fatal],
+      });
+    }
+  }
+
+  return Array.from(culpritsMap.values());
+}
+
+
+/**
+ * Return only a targeted 30-line window centered around lineNum
+ * (15 lines before to 15 lines after) with line numbers prepended.
+ *
  * @param {string} fileContent - Entire file text
  * @param {number} lineNum - Offending line number (1-indexed)
  * @param {number} [windowSize=15] - Lines before and after (default 15 = 30 lines total)
- * @returns {string} Numbered line window snippet
+ * @returns {string} Numbered line window snippet (e.g., '14: import toast from ...')
  */
 export function getLineWindow(fileContent, lineNum, windowSize = 15) {
   if (!fileContent || typeof fileContent !== "string") return "";
@@ -227,7 +268,38 @@ export function getLineWindow(fileContent, lineNum, windowSize = 15) {
   if (!num || isNaN(num)) {
     return lines.slice(0, windowSize * 2).map((l, idx) => `${idx + 1}: ${l}`).join("\n");
   }
-  const start = Math.max(0, num - windowSize - 1);
+  const start = Math.max(1, num - windowSize);
   const end = Math.min(lines.length, num + windowSize);
-  return lines.slice(start, end).map((l, idx) => `${start + idx + 1}: ${l}`).join("\n");
+  return lines.slice(start - 1, end).map((l, idx) => `${start + idx}: ${l}`).join("\n");
+}
+
+/**
+ * Backwards-compatible log parsing helper.
+ * @param {string | Buffer} rawLog
+ * @param {number} [maxLines=30]
+ */
+export function parseLog(rawLog, maxLines = 30) {
+  const rawText = extractRawLogText(rawLog);
+  const unstripped = stripAnsi(rawText).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const cleanLog = cleanGHActionsLog(unstripped);
+  const lines = cleanLog.split("\n").map((l) => l.trimEnd()).filter(Boolean);
+  const culprit = extractCulpritLocation(cleanLog);
+  const fatalErrorLine = extractFatalErrorLine(cleanLog);
+
+  let extractedWindow = lines.slice(-maxLines).join("\n");
+  const fatalIndex = lines.findIndex((l) => /\bFAIL\b/i.test(l) || /\berror:/i.test(l) || /\bError:/.test(l));
+  if (fatalIndex !== -1) {
+    const start = Math.max(0, fatalIndex - 5);
+    const end = Math.min(lines.length, start + maxLines);
+    extractedWindow = lines.slice(start, end).join("\n");
+  }
+
+  return {
+    cleanLog,
+    extractedWindow,
+    totalLines: lines.length,
+    culprit,
+    fatalErrorLine,
+    detectedTargets: culprit ? [{ file: culprit.targetFile, line: culprit.lineNum }] : [],
+  };
 }

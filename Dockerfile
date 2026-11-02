@@ -1,8 +1,10 @@
 # syntax=docker/dockerfile:1
-FROM node:20-alpine AS base
+FROM node:20-bookworm-slim AS base
 
-# Install system dependencies (git for GitOps checkouts)
-RUN apk add --no-cache git curl
+# Install system dependencies (git for GitOps checkouts, curl for healthchecks, ca-certificates for HTTPS)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -20,7 +22,9 @@ ENV NODE_ENV=production \
 
 EXPOSE 3000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:3000/probot || exit 1
+# Probot exposes /ping returning "PONG"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:3000/ping || exit 1
 
 CMD ["npm", "start"]
+
