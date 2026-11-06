@@ -288,9 +288,9 @@ export class DiagnoserAgent {
 
     const modifiedFiles = [];
     const rootCauses = [];
-    const maxFiles = Math.min(culprits.length, 10);
+    const maxFiles = Math.min(culprits.length, 30);
 
-    this.logger.info(`🛠️ Beginning multi-file remediation on ${maxFiles} broken file(s)...`);
+    this.logger.info(`🛠️ Beginning multi-file remediation on all ${maxFiles} broken file(s)...`);
 
     for (let i = 0; i < maxFiles; i++) {
       const culprit = culprits[i];
@@ -421,6 +421,17 @@ export class DiagnoserAgent {
         testOutput: "No patches applied.",
         iterations: 1,
       };
+    }
+
+    // Attempt auto-fix on lint commands if supported
+    if (testCommand.includes("lint")) {
+      const prefixMatch = testCommand.match(/--prefix\s+([\w.-]+)/);
+      const prefix = prefixMatch ? `--prefix ${prefixMatch[1]}` : "";
+      try {
+        await this.tools.runSandboxTest(`npm run lint ${prefix} --if-present -- --fix`);
+      } catch {
+        // Proceed to strict verification
+      }
     }
 
     this.logger.info(`Executing verification command on all ${modifiedFiles.length} patched file(s): '${testCommand}'...`);
