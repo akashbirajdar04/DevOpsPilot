@@ -23,6 +23,7 @@ Inspect the broken code snippet and return a minimal SEARCH/REPLACE diff resolvi
 ### OUTPUT FORMAT SPECIFICATION (STRICT)
 - Output ONLY a surgical SEARCH/REPLACE block with zero markdown prose or greeting.
 - SEARCH block must match target lines character-for-character including indentation (2-8 lines).
+- NEVER omit code or output placeholder comments like '// ... rest of code' or '// [Remaining lines omitted]'. Provide complete, syntactically valid code blocks.
 
 Required Structure:
 <<<<<<< SEARCH

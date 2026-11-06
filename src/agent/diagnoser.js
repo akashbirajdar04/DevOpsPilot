@@ -57,6 +57,16 @@ export function cleanRawCodeOutput(rawContent) {
 }
 
 /**
+ * Detect if LLM generated truncated code or omitted-line placeholders.
+ * @param {string} code
+ * @returns {boolean}
+ */
+export function isTruncatedCode(code) {
+  if (!code) return false;
+  return /(\/\/|\/\*)\s*(\[?.*(?:remaining lines|rest of code|code omitted|token limits))/i.test(code);
+}
+
+/**
  * Surgically apply SEARCH/REPLACE blocks to file content.
  * @param {string} fullContent
  * @param {string} patchText
@@ -185,6 +195,7 @@ export class DiagnoserAgent {
           { role: "user", content: prompt },
         ],
         temperature: 0.1,
+        max_tokens: 4096,
       });
     } catch (groqErr) {
       const isModelNotFound =
@@ -202,6 +213,7 @@ export class DiagnoserAgent {
           model: this.model,
           messages: [{ role: "user", content: prompt }],
           temperature: 0.1,
+          max_tokens: 4096,
         });
       } else {
         throw groqErr;
@@ -355,7 +367,8 @@ export class DiagnoserAgent {
         }
 
         const linesCount = fullContent.split("\n").length;
-        const isFullFile = linesCount <= 120;
+        // Never pass full files in multi-file remediation unless tiny (<= 25 lines)
+        const isFullFile = linesCount <= 25;
         let snippet = "";
 
         if (isFullFile) {
@@ -386,6 +399,7 @@ export class DiagnoserAgent {
                 { role: "user", content: prompt },
               ],
               temperature: 0.1,
+              max_tokens: 4096,
             });
             break;
           } catch (groqErr) {
@@ -430,6 +444,11 @@ export class DiagnoserAgent {
           continue;
         }
 
+        if (isTruncatedCode(cleaned)) {
+          this.logger.warn(`[Groq] Detected truncation or placeholder comments in output for '${targetFile}'. Skipping to protect file.`);
+          continue;
+        }
+
         let finalCode = "";
         const searchReplaced = applySearchReplace(fullContent, cleaned);
         if (searchReplaced) {
@@ -442,22 +461,16 @@ export class DiagnoserAgent {
             this.logger.warn(`Could not safely match diff markers for '${targetFile}'. Skipping.`);
             continue;
           }
-        } else if (isFullFile) {
+        } else if (isFullFile && cleaned.length >= fullContent.length * 0.7) {
           finalCode = cleaned;
         } else {
-          if (cleaned.length > fullContent.length * 0.7) {
-            finalCode = cleaned;
-          } else {
-            finalCode = fullContent.replace(snippet, cleaned);
-            if (!fullContent.includes(snippet)) {
-              finalCode = cleaned;
-            }
-          }
+          this.logger.warn(`Could not safely determine surgical patch for '${targetFile}'. Skipping to prevent corruption.`);
+          continue;
         }
 
-        // Safety guard: Never write raw conflict markers into source code
-        if (finalCode.includes("<<<<<<< SEARCH") || finalCode.includes(">>>>>>> REPLACE")) {
-          this.logger.warn(`Conflict markers detected in output for '${targetFile}'. Skipping to protect file.`);
+        // Safety guard: Never write raw conflict markers or truncated code into source code
+        if (finalCode.includes("<<<<<<< SEARCH") || finalCode.includes(">>>>>>> REPLACE") || isTruncatedCode(finalCode)) {
+          this.logger.warn(`Conflict markers or truncation detected in output for '${targetFile}'. Skipping to protect file.`);
           continue;
         }
 

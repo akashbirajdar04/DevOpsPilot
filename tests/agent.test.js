@@ -23,6 +23,7 @@ import {
   buildSingleShotPrompt,
   cleanRawCodeOutput,
   applySearchReplace,
+  isTruncatedCode,
   SRE_SYSTEM_PROMPT,
   buildRemediationUserPrompt,
 } from "../src/agent/diagnoser.js";
@@ -121,6 +122,17 @@ test("DiagnoserAgent: applySearchReplace applies surgical search and replace blo
   assert.notEqual(updated, null);
   assert.equal(updated.includes("const [_setDay, _setSlot] = useState();"), true);
   assert.equal(updated.includes("export const App = () => <div>Hello</div>;"), true);
+});
+
+test("DiagnoserAgent: isTruncatedCode detects LLM truncation and placeholder comments", () => {
+  const truncated1 = "const Messrequest\n// [Remaining lines omitted to stay within token limits]";
+  assert.equal(isTruncatedCode(truncated1), true);
+
+  const truncated2 = "export default App;\n/* ... rest of code */";
+  assert.equal(isTruncatedCode(truncated2), true);
+
+  const validCode = "const Messrequest = React.lazy(() => import('./mess.jsx'));\nexport default Messrequest;";
+  assert.equal(isTruncatedCode(validCode), false);
 });
 
 
