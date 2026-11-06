@@ -7,8 +7,10 @@ import Groq from "groq-sdk";
 import { extractFatalErrorLine, getLineWindow } from "../services/logParser.js";
 import { sleep } from "../config.js";
 import { SRE_SYSTEM_PROMPT, buildRemediationUserPrompt } from "./prompts.js";
+import { DeterministicFixer } from "../services/deterministicFixer.js";
+import { validatePatchOutput, validateModifiedFile } from "./validator.js";
 
-export { SRE_SYSTEM_PROMPT, buildRemediationUserPrompt };
+export { SRE_SYSTEM_PROMPT, buildRemediationUserPrompt, validatePatchOutput, validateModifiedFile };
 
 /**
  * Build the single-shot prompt specified for deterministic repair.
@@ -282,6 +284,19 @@ export class DiagnoserAgent {
       };
     }
 
+    const patchVal = validatePatchOutput(fixedCode, targetFile);
+    if (!patchVal.valid) {
+      this.logger.warn(`Single-shot patch validation rejected: ${patchVal.reason}`);
+      return {
+        success: false,
+        rootCause: `Single-shot repair rejected by validation: ${patchVal.reason}`,
+        modifiedFiles: [],
+        testCommand,
+        testOutput: patchVal.reason,
+        iterations: 1,
+      };
+    }
+
     // 1. Overwrite target file with returned code
     await this.tools.applyFilePatch(targetFile, fixedCode);
 
@@ -348,15 +363,70 @@ export class DiagnoserAgent {
 
     const modifiedFiles = [];
     const rootCauses = [];
-    const maxFiles = Math.min(culprits.length, 30);
 
-    this.logger.info(`🛠️ Beginning multi-file remediation on all ${maxFiles} broken file(s)...`);
+    // -------------------------------------------------------------------------
+    // Phase 1: Local Deterministic Repair (0 Tokens Consumed)
+    // -------------------------------------------------------------------------
+    const deterministicFixer = new DeterministicFixer({ tools: this.tools, logger: this.logger });
+    const byFileMap = new Map();
+    for (const culprit of culprits) {
+      const errList = culprit.structuredErrors || (culprit.errors || []).map((e) => ({
+        filePath: culprit.targetFile,
+        lineNum: culprit.lineNum || 1,
+        rule: String(e).match(/\b([a-zA-Z0-9_\-/@]+)$/)?.[1] || "",
+        symbol: String(e).match(/'([a-zA-Z0-9_$]+)'|"([a-zA-Z0-9_$]+)"/)?.[1] || "",
+        message: String(e),
+        raw: String(e),
+      }));
+      byFileMap.set(culprit.targetFile, errList);
+    }
+
+    this.logger.info(`⚡ Attempting local deterministic auto-fixes across ${culprits.length} file(s)...`);
+    const { repairedFiles, residualFiles, allFixes } = await deterministicFixer.runBatchDeterministicRepair(byFileMap);
+
+    if (repairedFiles.length > 0) {
+      modifiedFiles.push(...repairedFiles);
+      rootCauses.push(...allFixes.map((f) => `- ${f}`));
+      this.logger.info(`✅ Deterministically repaired ${repairedFiles.length} file(s) locally without LLM calls.`);
+    }
+
+    // Fast verification: did deterministic auto-fixes resolve all failures?
+    let preCheckPassed = false;
+    try {
+      this.logger.info(`Executing fast verification check: '${testCommand}'...`);
+      const preCheckJson = await this.tools.runSandboxTest(testCommand);
+      const preCheck = JSON.parse(preCheckJson);
+      if (preCheck.exitCode === 0 && modifiedFiles.length > 0) {
+        preCheckPassed = true;
+        this.logger.info(`🎉 All CI issues resolved deterministically in sandbox! Total LLM tokens used: 0.`);
+        return {
+          success: true,
+          rootCause: `Automated deterministic remediation resolved errors across ${modifiedFiles.length} file(s) with 0 LLM tokens:\n${rootCauses.join("\n")}`,
+          modifiedFiles,
+          testCommand,
+          testOutput: preCheck.stdout || "Verification passed cleanly with exit code 0.",
+          iterations: 1,
+        };
+      }
+    } catch {
+      // Continue to LLM remediation for residual files
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 2: Token-Budgeted LLM Pipeline for Residual Files
+    // -------------------------------------------------------------------------
+    const targetsToFix = culprits.filter((c) => residualFiles.includes(c.targetFile) || !preCheckPassed);
+    const maxFiles = Math.min(targetsToFix.length, 15);
+
+    if (maxFiles > 0) {
+      this.logger.info(`🤖 Dispatching LLM remediation on ${maxFiles} residual file(s) (1 file/turn, max 3k in / 1k out)...`);
+    }
 
     for (let i = 0; i < maxFiles; i++) {
-      const culprit = culprits[i];
+      const culprit = targetsToFix[i];
       const targetFile = culprit.targetFile;
       const errorText = Array.isArray(culprit.errors) && culprit.errors.length > 0
-        ? culprit.errors.slice(0, 5).join("\n")
+        ? culprit.errors.slice(0, 3).join("\n")
         : `CI failure at line ${culprit.lineNum}`;
 
       try {
@@ -375,6 +445,11 @@ export class DiagnoserAgent {
           snippet = fullContent;
         } else {
           snippet = getLineWindow(fullContent, culprit.lineNum || 1, 15);
+        }
+
+        // Clamp snippet to stay strictly under input budget (~3000 tokens / 10,000 chars)
+        if (snippet.length > 8000) {
+          snippet = snippet.slice(0, 8000);
         }
 
         this.logger.info(`[${i + 1}/${maxFiles}] [Groq (${this.model})] Patching '${targetFile}' (${culprit.errors?.length || 1} error(s))...`);
@@ -399,7 +474,7 @@ export class DiagnoserAgent {
                 { role: "user", content: prompt },
               ],
               temperature: 0.1,
-              max_tokens: 4096,
+              max_tokens: 1024,
             });
             break;
           } catch (groqErr) {
@@ -413,7 +488,7 @@ export class DiagnoserAgent {
             if (isConnectionOrRateLimit && attempts < maxAttempts) {
               const backoff = attempts * 3000;
               this.logger.warn(
-                `[Groq] Connection/rate-limit error on '${targetFile}' (${groqErr.message}). Retrying in ${backoff / 1000}s (attempt ${attempts}/${maxAttempts})...`
+                `[Groq] Rate-limit/timeout on '${targetFile}' (${groqErr.message}). Retrying in ${backoff / 1000}s (attempt ${attempts}/${maxAttempts})...`
               );
               await sleep(backoff);
               continue;
@@ -439,13 +514,10 @@ export class DiagnoserAgent {
         const rawOutput = completion?.choices?.[0]?.message?.content || "";
         const cleaned = cleanRawCodeOutput(rawOutput);
 
-        if (!cleaned) {
-          this.logger.warn(`Empty response for '${targetFile}'. Skipping.`);
-          continue;
-        }
-
-        if (isTruncatedCode(cleaned)) {
-          this.logger.warn(`[Groq] Detected truncation or placeholder comments in output for '${targetFile}'. Skipping to protect file.`);
+        // Strong AI Output Validation
+        const patchValidation = validatePatchOutput(cleaned, targetFile);
+        if (!patchValidation.valid) {
+          this.logger.warn(`[Validation Rejected] Patch for '${targetFile}': ${patchValidation.reason}`);
           continue;
         }
 
@@ -468,17 +540,20 @@ export class DiagnoserAgent {
           continue;
         }
 
-        // Safety guard: Never write raw conflict markers or truncated code into source code
-        if (finalCode.includes("<<<<<<< SEARCH") || finalCode.includes(">>>>>>> REPLACE") || isTruncatedCode(finalCode)) {
-          this.logger.warn(`Conflict markers or truncation detected in output for '${targetFile}'. Skipping to protect file.`);
+        // Strong AI Output Validation on Modified File
+        const fileValidation = validateModifiedFile(fullContent, finalCode, targetFile);
+        if (!fileValidation.valid) {
+          this.logger.warn(`[Validation Rejected] Modified '${targetFile}': ${fileValidation.reason}`);
           continue;
         }
 
         await this.tools.applyFilePatch(targetFile, finalCode);
-        modifiedFiles.push(targetFile);
-        rootCauses.push(`- \`${targetFile}\`: resolved ${culprit.errors?.length || 1} error(s)`);
+        if (!modifiedFiles.includes(targetFile)) {
+          modifiedFiles.push(targetFile);
+        }
+        rootCauses.push(`- \`${targetFile}\`: resolved ${culprit.errors?.length || 1} error(s) via LLM`);
 
-        // Rate-limit safety pause before next file
+        // Rate-limit safety pause before next file (default 2s)
         if (i < maxFiles - 1 && delayMs > 0) {
           await sleep(delayMs);
         }

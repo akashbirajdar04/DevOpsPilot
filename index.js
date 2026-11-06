@@ -8,7 +8,8 @@ import { execa } from "execa";
 import { DiagnoserAgent } from "./src/agent/diagnoser.js";
 import { AgentTools } from "./src/agent/tools.js";
 import { GitOpsService } from "./src/services/gitOps.js";
-import { extractAllCulprits, extractCulpritLocation, extractFatalErrorLine, getLineWindow, extractRawLogText, cleanRepoFilePath } from "./src/services/logParser.js";
+import { extractAllCulprits, extractCulpritLocation, extractFatalErrorLine, getLineWindow, extractRawLogText, cleanRepoFilePath, diagnoseLogErrors } from "./src/services/logParser.js";
+import { globalRunLock } from "./src/utils/runLock.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Sandbox } from "./src/services/sandbox.js";
@@ -39,6 +40,16 @@ export default function healOpsApp(app, optionsOrBootTime) {
     const repo = repository.name;
 
     // -------------------------------------------------------------------------
+    // Guard 0: In-Flight Run Locking (Drop duplicate concurrent deliveries)
+    // -------------------------------------------------------------------------
+    if (!globalRunLock.acquire(runId)) {
+      app.log.warn(
+        `[DUPLICATE RUN GUARD] Run #${runId} is currently being actively processed by another worker. Dropping duplicate webhook delivery.`
+      );
+      return;
+    }
+
+    // -------------------------------------------------------------------------
     // Guard 1: Drop Stale Replayed Runs from Smee.io
     // -------------------------------------------------------------------------
     const runCompletedAt = new Date(
@@ -48,6 +59,7 @@ export default function healOpsApp(app, optionsOrBootTime) {
       app.log.info(
         `[STALE EVENT] Dropping replayed run from Smee.io (Run #${runId}, completed at ${runCompletedAt.toISOString()})`
       );
+      globalRunLock.release(runId);
       return;
     }
 
@@ -56,6 +68,7 @@ export default function healOpsApp(app, optionsOrBootTime) {
     // -------------------------------------------------------------------------
     if (conclusion !== "failure") {
       app.log.info(`Skipping non-failure run conclusion: '${conclusion}'`);
+      globalRunLock.release(runId);
       return;
     }
 
@@ -66,6 +79,7 @@ export default function healOpsApp(app, optionsOrBootTime) {
       app.log.info(
         `[ANTI-LOOP GUARD] Skipping run #${runId} on '${headBranch}' to prevent recursive remediation trigger.`
       );
+      globalRunLock.release(runId);
       return;
     }
 
@@ -110,9 +124,24 @@ export default function healOpsApp(app, optionsOrBootTime) {
     const logText = extractRawLogText(rawLogBuffer || "CI Workflow Job Failed with exit code 1.");
 
     // -------------------------------------------------------------------------
-    // Step 2: Deterministic Culprit Extraction (single or multi-file)
+    // Step 2: Deterministic Culprit Extraction & Log Diagnosis
     // -------------------------------------------------------------------------
-    let culprits = extractAllCulprits(logText, repo);
+    const diagnostics = diagnoseLogErrors(logText, repo);
+    let culprits = [];
+
+    if (diagnostics.byFile.size > 0) {
+      culprits = Array.from(diagnostics.byFile.entries()).map(([targetFile, errs]) => ({
+        targetFile,
+        lineNum: errs[0].lineNum || 1,
+        errors: errs.map((e) => e.message || e.raw),
+        structuredErrors: errs,
+      }));
+      app.log.info(
+        `🎯 Structured log diagnosis identified ${diagnostics.errors.length} error(s) across ${culprits.length} file(s). Categories: ${JSON.stringify(diagnostics.summary.categories)}`
+      );
+    } else {
+      culprits = extractAllCulprits(logText, repo);
+    }
 
     if (!culprits || culprits.length === 0) {
       const single = extractCulpritLocation(logText);
@@ -125,6 +154,7 @@ export default function healOpsApp(app, optionsOrBootTime) {
 
     if (!culprits || culprits.length === 0) {
       app.log.warn(`No culprit files detected via regex in Run #${runId} logs. Exiting cleanly.`);
+      globalRunLock.release(runId);
       return;
     }
 
@@ -283,6 +313,7 @@ export default function healOpsApp(app, optionsOrBootTime) {
     } catch (err) {
       app.log.error(`Unhandled error during single-shot remediation: ${err.message}`);
     } finally {
+      globalRunLock.release(runId);
       await sandbox.cleanup();
     }
   });

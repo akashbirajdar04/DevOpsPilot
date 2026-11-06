@@ -15,6 +15,7 @@ import {
   extractAllCulprits,
   extractFatalErrorLine,
   getLineWindow,
+  diagnoseLogErrors,
 } from "../src/services/logParser.js";
 import { Sandbox } from "../src/services/sandbox.js";
 import { AgentTools } from "../src/agent/tools.js";
@@ -27,6 +28,15 @@ import {
   SRE_SYSTEM_PROMPT,
   buildRemediationUserPrompt,
 } from "../src/agent/diagnoser.js";
+import { RunLock } from "../src/utils/runLock.js";
+import { DeterministicFixer } from "../src/services/deterministicFixer.js";
+import {
+  validatePatchOutput,
+  validateModifiedFile,
+  hasTruncationMarkers,
+  hasUninitializedConst,
+  hasBalancedBrackets,
+} from "../src/agent/validator.js";
 
 import { GitOpsService } from "../src/services/gitOps.js";
 import healOpsApp from "../index.js";
@@ -503,4 +513,157 @@ test("DiagnoserAgent: runMultiFileRemediation patches all broken files and verif
     await fs.rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test("RunLock: prevents duplicate concurrent processing of same workflow run", () => {
+  const lock = new RunLock(1000);
+  assert.equal(lock.acquire("run-123"), true);
+  assert.equal(lock.acquire("run-123"), false); // Blocked duplicate
+  assert.equal(lock.acquire("run-456"), true); // Separate run allowed
+
+  assert.equal(lock.isLocked("run-123"), true);
+  assert.equal(lock.release("run-123"), true);
+  assert.equal(lock.isLocked("run-123"), false);
+
+  // Can acquire again after release
+  assert.equal(lock.acquire("run-123"), true);
+  lock.clear();
+});
+
+test("logParser: diagnoseLogErrors extracts structured errors, groups by file, and ignores warnings", () => {
+  const sampleLog = [
+    "/workspace/frontend/src/components/user/user.jsx",
+    "  4:18  error  'setCap' is assigned a value but never used  no-unused-vars",
+    "  4:28  error  'useState' is not defined  no-undef",
+    "  4:28  error  React Hook \"useState\" cannot be called at the top level  react-hooks/rules-of-hooks",
+    "  10:5  warning  Unexpected console statement  no-console",
+    "/workspace/frontend/src/App.jsx:26:6: ERROR: The constant \"Messrequest\" must be initialized",
+  ].join("\n");
+
+  const diag = diagnoseLogErrors(sampleLog);
+  assert.equal(diag.summary.totalErrors, 4); // 3 eslint errors + 1 esbuild error, 1 warning ignored
+  assert.equal(diag.byFile.size, 2);
+
+  const userErrors = diag.byFile.get("frontend/src/components/user/user.jsx");
+  assert.equal(userErrors.length, 3);
+  assert.equal(userErrors[0].symbol, "setCap");
+  assert.equal(userErrors[0].rule, "no-unused-vars");
+  assert.equal(userErrors[1].rule, "no-undef");
+  assert.equal(userErrors[2].rule, "react-hooks/rules-of-hooks");
+
+  const appErrors = diag.byFile.get("frontend/src/App.jsx");
+  assert.equal(appErrors.length, 1);
+  assert.equal(appErrors[0].category, "esbuild");
+  assert.equal(appErrors[0].symbol, "Messrequest");
+});
+
+test("DeterministicFixer: fixes unused vars, missing React imports, and relocates top-level hooks without LLM", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "healops-det-fixer-"));
+  try {
+    const sandbox = new Sandbox(tempDir);
+    const tools = new AgentTools({ workspaceDir: tempDir, sandbox });
+    const fixer = new DeterministicFixer({ tools });
+
+    const brokenUserJsx = [
+      "const [cap, setCap] = useState(0);",
+      "export default function UserProfile() {",
+      "  return <div>{cap}</div>;",
+      "}",
+    ].join("\n");
+
+    const filePath = "src/UserProfile.jsx";
+    await fs.mkdir(path.join(tempDir, "src"), { recursive: true });
+    await fs.writeFile(path.join(tempDir, filePath), brokenUserJsx, "utf-8");
+
+    const errors = [
+      {
+        filePath,
+        lineNum: 1,
+        rule: "no-unused-vars",
+        symbol: "setCap",
+        message: "'setCap' is assigned a value but never used",
+      },
+      {
+        filePath,
+        lineNum: 1,
+        rule: "no-undef",
+        symbol: "useState",
+        message: "'useState' is not defined",
+      },
+      {
+        filePath,
+        lineNum: 1,
+        rule: "react-hooks/rules-of-hooks",
+        symbol: "useState",
+        message: 'React Hook "useState" cannot be called at the top level',
+      },
+    ];
+
+    const result = await fixer.fixFile(filePath, errors);
+    assert.equal(result.fixed, true);
+    assert.equal(result.appliedFixes.length >= 2, true);
+
+    const fixedContent = await fs.readFile(path.join(tempDir, filePath), "utf-8");
+    // 1. React and useState import added
+    assert.equal(fixedContent.includes("import React, { useState, useEffect } from \"react\";"), true);
+    // 2. Unused setCap prefixed with _setCap
+    assert.equal(fixedContent.includes("_setCap"), true);
+    // 3. Hook relocated inside function
+    assert.equal(fixedContent.includes("export default function UserProfile() {\n  const [cap, _setCap] = useState(0);"), true);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Validator: validatePatchOutput and validateModifiedFile reject broken AI outputs", () => {
+  // 1. Reject truncation markers
+  const truncatedPatch = "const x = 1;\n// [Remaining lines omitted to stay within token limits]";
+  assert.equal(validatePatchOutput(truncatedPatch).valid, false);
+
+  // 2. Reject raw merge conflict markers
+  const conflictPatch = "<<<<<<< HEAD\nconst x = 1;\n=======\nconst x = 2;\n>>>>>>> origin/main";
+  assert.equal(validatePatchOutput(conflictPatch).valid, false);
+
+  // 3. Reject uninitialized constants
+  const uninitConst = "const Messrequest\nexport default Messrequest;";
+  assert.equal(validatePatchOutput(uninitConst).valid, false);
+  assert.equal(hasUninitializedConst(uninitConst), true);
+
+  // 4. Reject unclosed markdown code fences
+  const unclosedFence = "```javascript\nconst x = 1;\n";
+  assert.equal(validatePatchOutput(unclosedFence).valid, false);
+
+  // 5. Valid surgical patch passes
+  const validPatch = "<<<<<<< SEARCH\nconst a = 1;\n=======\nconst a = 2;\n>>>>>>> REPLACE";
+  assert.equal(validatePatchOutput(validPatch).valid, true);
+
+  // 6. Validate modified file rejects destructive shrinkage
+  const original = "a".repeat(1000);
+  const shrunken = "a".repeat(200);
+  assert.equal(validateModifiedFile(original, shrunken, "test.js").valid, false);
+
+  // 7. Validate balanced brackets in JS/JSX
+  assert.equal(hasBalancedBrackets("function App() { return (<div>Hi</div>); }"), true);
+  assert.equal(hasBalancedBrackets("function App() { return (<div>Hi</div>);"), false);
+});
+
+test("AgentTools: getRepoFile returns full content without 1800-char truncation", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "healops-tools-test-"));
+  try {
+    const sandbox = new Sandbox(tempDir);
+    const tools = new AgentTools({ workspaceDir: tempDir, sandbox });
+
+    // File with 3,000 characters (> 1,800 characters)
+    const longContent = "const line = 'very long code statement here';\n".repeat(70);
+    assert.equal(longContent.length > 2500, true);
+
+    await fs.writeFile(path.join(tempDir, "largeFile.js"), longContent, "utf-8");
+
+    const fetched = await tools.getRepoFile("largeFile.js");
+    assert.equal(fetched.length, longContent.length);
+    assert.equal(fetched.includes("// [Remaining lines omitted"), false);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 

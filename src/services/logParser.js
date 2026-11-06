@@ -274,6 +274,200 @@ export function getLineWindow(fileContent, lineNum, windowSize = 15) {
 }
 
 /**
+ * Structured error diagnostic result representation.
+ * @typedef {object} DiagnosticError
+ * @property {string} filePath - Repo relative file path
+ * @property {number} lineNum - Offending line number (1-indexed)
+ * @property {number} [colNum] - Offending column number
+ * @property {"error"|"warning"} severity
+ * @property {"eslint"|"esbuild"|"typescript"|"syntax"|"test"|"build"} category
+ * @property {string} [rule] - Specific linter rule or compiler code (e.g., 'no-unused-vars', 'TS2322')
+ * @property {string} [symbol] - Extracted identifier/variable name
+ * @property {string} message - Clean error message
+ * @property {string} raw - Original log line
+ */
+
+/**
+ * Deterministically parse, group, and deduplicate CI build/linter/test errors from logs.
+ * Filters out warnings, noise, and ANSI escape sequences.
+ *
+ * @param {string} logText
+ * @param {string} [repoName=""]
+ * @returns {{ errors: DiagnosticError[], byFile: Map<string, DiagnosticError[]>, summary: { totalErrors: number, filesCount: number, categories: Record<string, number> } }}
+ */
+export function diagnoseLogErrors(logText, repoName = "") {
+  const rawText = extractRawLogText(logText);
+  const cleaned = cleanGHActionsLog(stripAnsi(rawText)).replace(/\\/g, "/");
+  const lines = cleaned.split("\n");
+
+  const errors = [];
+  const seen = new Set();
+  const byFile = new Map();
+  const categories = {};
+
+  let currentFile = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    // Ignore GHA infrastructure lines and notices
+    if (/^(?:##\[|===|\s*>|\s*npm\s+(?:notice|warn)|Process completed with exit code)/i.test(line)) {
+      continue;
+    }
+
+    // 1. Check for File Header in ESLint / table-style output: /path/to/file.ext
+    const fileHeaderMatch = line.match(/^(?:(?:\/|[a-zA-Z]:\/)[a-zA-Z0-9_\-./]+|(?:[a-zA-Z0-9_\-.]+\/)+[a-zA-Z0-9_\-.]+)\.(?:jsx?|tsx?|json|py)$/i);
+    if (fileHeaderMatch && !line.includes(" error ") && !line.includes(" warning ")) {
+      currentFile = cleanRepoFilePath(fileHeaderMatch[0], repoName);
+      continue;
+    }
+
+    // 2. ESLint error line under currentFile: "  4:18  error  'setCap' is assigned a value...  no-unused-vars"
+    const eslintMatch = line.match(/^(\d+):(\d+)\s+error\s+(.*?)(?:\s{2,}([a-zA-Z0-9_\-/@]+))?$/i);
+    if (eslintMatch && currentFile) {
+      const lineNum = parseInt(eslintMatch[1], 10);
+      const colNum = parseInt(eslintMatch[2], 10);
+      const message = eslintMatch[3].trim();
+      const rule = (eslintMatch[4] || "").trim();
+
+      // Extract symbol name if present in quotes
+      const symMatch = message.match(/'([a-zA-Z0-9_$]+)'|"([a-zA-Z0-9_$]+)"/);
+      const symbol = symMatch ? symMatch[1] || symMatch[2] : "";
+
+      const key = `${currentFile}:${lineNum}:${rule}:${message}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        const errObj = {
+          filePath: currentFile,
+          lineNum,
+          colNum,
+          severity: "error",
+          category: "eslint",
+          rule: rule || "linter",
+          symbol,
+          message,
+          raw: line,
+        };
+        errors.push(errObj);
+        if (!byFile.has(currentFile)) byFile.set(currentFile, []);
+        byFile.get(currentFile).push(errObj);
+        categories.eslint = (categories.eslint || 0) + 1;
+      }
+      continue;
+    }
+
+    // 3. Vite / ESBuild error format:
+    // /path/to/App.jsx:26:6: ERROR: The constant "Messrequest" must be initialized
+    const esbuildMatch = line.match(/^(.*?):(\d+):(\d+):\s*(?:ERROR|error):\s*(.*)$/i);
+    if (esbuildMatch) {
+      const rawPath = esbuildMatch[1].trim();
+      if (/\.(?:jsx?|tsx?|json|py)$/i.test(rawPath)) {
+        const filePath = cleanRepoFilePath(rawPath, repoName);
+        const lineNum = parseInt(esbuildMatch[2], 10);
+        const colNum = parseInt(esbuildMatch[3], 10);
+        const message = esbuildMatch[4].trim();
+
+        const symMatch = message.match(/"([a-zA-Z0-9_$]+)"|'([a-zA-Z0-9_$]+)'/);
+        const symbol = symMatch ? symMatch[1] || symMatch[2] : "";
+
+        const key = `${filePath}:${lineNum}:esbuild:${message}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          const errObj = {
+            filePath,
+            lineNum,
+            colNum,
+            severity: "error",
+            category: "esbuild",
+            rule: "esbuild-transform",
+            symbol,
+            message,
+            raw: line,
+          };
+          errors.push(errObj);
+          if (!byFile.has(filePath)) byFile.set(filePath, []);
+          byFile.get(filePath).push(errObj);
+          categories.esbuild = (categories.esbuild || 0) + 1;
+        }
+        continue;
+      }
+    }
+
+    // 4. TypeScript compiler format:
+    // src/file.ts:15:3 - error TS2322: Type 'string' is not assignable to type 'number'.
+    const tsMatch = line.match(/^(.*?):(\d+):(\d+)\s*-\s*error\s*(TS\d+):\s*(.*)$/i);
+    if (tsMatch) {
+      const filePath = cleanRepoFilePath(tsMatch[1].trim(), repoName);
+      const lineNum = parseInt(tsMatch[2], 10);
+      const colNum = parseInt(tsMatch[3], 10);
+      const rule = tsMatch[4];
+      const message = tsMatch[5].trim();
+
+      const key = `${filePath}:${lineNum}:${rule}:${message}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        const errObj = {
+          filePath,
+          lineNum,
+          colNum,
+          severity: "error",
+          category: "typescript",
+          rule,
+          message,
+          raw: line,
+        };
+        errors.push(errObj);
+        if (!byFile.has(filePath)) byFile.set(filePath, []);
+        byFile.get(filePath).push(errObj);
+        categories.typescript = (categories.typescript || 0) + 1;
+      }
+      continue;
+    }
+
+    // 5. Standard single-line error format: path/to/file.jsx:10:15 or path/to/file.jsx:10
+    const singleMatch = line.match(/^((?:[\w.-]+\/)*[\w.-]+\.(?:jsx?|tsx?|json|py)):(\d+)(?::(\d+))?/i);
+    if (singleMatch && (/\berror\b/i.test(line) || /\bFAIL\b/i.test(line) || /\bSyntaxError\b/i.test(line))) {
+      const filePath = cleanRepoFilePath(singleMatch[1], repoName);
+      const lineNum = parseInt(singleMatch[2], 10);
+      const colNum = singleMatch[3] ? parseInt(singleMatch[3], 10) : undefined;
+      const message = line.slice(singleMatch[0].length).replace(/^[\s:-]+/, "").trim() || line;
+
+      const key = `${filePath}:${lineNum}:syntax:${message}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        const errObj = {
+          filePath,
+          lineNum,
+          colNum,
+          severity: "error",
+          category: "syntax",
+          rule: "syntax-error",
+          message,
+          raw: line,
+        };
+        errors.push(errObj);
+        if (!byFile.has(filePath)) byFile.set(filePath, []);
+        byFile.get(filePath).push(errObj);
+        categories.syntax = (categories.syntax || 0) + 1;
+      }
+      continue;
+    }
+  }
+
+  return {
+    errors,
+    byFile,
+    summary: {
+      totalErrors: errors.length,
+      filesCount: byFile.size,
+      categories,
+    },
+  };
+}
+
+/**
  * Backwards-compatible log parsing helper.
  * @param {string | Buffer} rawLog
  * @param {number} [maxLines=30]

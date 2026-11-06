@@ -123,7 +123,7 @@ export class AgentTools {
 
   /**
    * Return only lines (targetLine - window) to (targetLine + window) with line numbers prepended.
-   * Capped to a hard limit of 1,800 characters (~450 tokens).
+   * If targetLine is null, returns complete raw content without artificial truncation.
    *
    * @param {string} content - Raw file content
    * @param {number|null} [targetLine=null] - Target center line
@@ -131,29 +131,20 @@ export class AgentTools {
    * @returns {string}
    */
   _formatLineWindow(content, targetLine = null, window = 25) {
+    if (!content) return "";
+    if (targetLine === null || targetLine === undefined || isNaN(parseInt(targetLine, 10))) {
+      return content;
+    }
+
     const lines = content.split("\n");
-    let output = "";
-
-    if (targetLine !== null && targetLine !== undefined && !isNaN(parseInt(targetLine, 10))) {
-      const target = parseInt(targetLine, 10);
-      const win = parseInt(window, 10) || 25;
-      const start = Math.max(1, target - win);
-      const end = Math.min(lines.length, target + win);
-      output = lines
-        .slice(start - 1, end)
-        .map((l, idx) => `${start + idx}: ${l}`)
-        .join("\n");
-    } else {
-      output = content;
-    }
-
-    const HARD_LIMIT = 1800;
-    const TRUNCATION_NOTICE = "\n// [Remaining lines omitted to stay within token limits]";
-    if (output.length > HARD_LIMIT) {
-      output = output.slice(0, HARD_LIMIT) + TRUNCATION_NOTICE;
-    }
-
-    return output;
+    const target = parseInt(targetLine, 10);
+    const win = parseInt(window, 10) || 25;
+    const start = Math.max(1, target - win);
+    const end = Math.min(lines.length, target + win);
+    return lines
+      .slice(start - 1, end)
+      .map((l, idx) => `${start + idx}: ${l}`)
+      .join("\n");
   }
 
   /**
