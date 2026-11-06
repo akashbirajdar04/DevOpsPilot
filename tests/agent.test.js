@@ -29,7 +29,7 @@ import {
   buildRemediationUserPrompt,
 } from "../src/agent/diagnoser.js";
 import { RunLock } from "../src/utils/runLock.js";
-import { DeterministicFixer, renameUnusedIdentifier } from "../src/services/deterministicFixer.js";
+import { DeterministicFixer, renameUnusedIdentifier, autoFixUnusedVariable } from "../src/services/deterministicFixer.js";
 import {
   validatePatchOutput,
   validateModifiedFile,
@@ -605,17 +605,21 @@ test("DeterministicFixer: fixes unused vars, missing React imports, and relocate
     const fixedContent = await fs.readFile(path.join(tempDir, filePath), "utf-8");
     // 1. React and useState import added
     assert.equal(fixedContent.includes("import React, { useState, useEffect } from \"react\";"), true);
-    // 2. Unused setCap prefixed with _setCap
-    assert.equal(fixedContent.includes("_setCap"), true);
+    // 2. Unused setCap removed from destructuring
+    assert.equal(fixedContent.includes("const [cap] = useState(0);"), true);
     // 3. Hook relocated inside function
-    assert.equal(fixedContent.includes("export default function UserProfile() {\n  const [cap, _setCap] = useState(0);"), true);
+    assert.equal(fixedContent.includes("export default function UserProfile() {\n  const [cap] = useState(0);"), true);
 
-    // 4. Safe import renaming (never corrupts path specifier)
-    const namedImportLine = 'import { api } from "../lib/api";';
-    assert.equal(renameUnusedIdentifier(namedImportLine, "api"), 'import { api as _api } from "../lib/api";');
+    // 4. Catch blocks converted to optional catch binding 'catch {}' (no unused error variable)
+    assert.equal(autoFixUnusedVariable("} catch (e) {", "e"), "} catch {");
+    assert.equal(autoFixUnusedVariable("} catch (_e) {", "_e"), "} catch {");
 
-    const defaultImportLine = 'import api from "../lib/api";';
-    assert.equal(renameUnusedIdentifier(defaultImportLine, "api"), 'import _api from "../lib/api";');
+    // 5. Unused imports removed
+    assert.equal(autoFixUnusedVariable("import { _Icon } from 'lucide-react';", "_Icon"), "");
+    assert.equal(autoFixUnusedVariable("import { _Icon, Users } from 'lucide-react';", "_Icon"), "import { Users } from 'lucide-react';");
+
+    // 6. Unused arrow function callbacks: (_e) => -> () =>
+    assert.equal(autoFixUnusedVariable("const onClick = (_e) => handleClick();", "_e"), "const onClick = () => handleClick();");
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }

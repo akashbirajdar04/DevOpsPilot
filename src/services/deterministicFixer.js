@@ -8,44 +8,95 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 /**
- * Safely rename an unused variable in a code line without modifying import paths, string literals, or properties.
+ * Safely autofix unused variables (ESLint 'no-unused-vars') using deterministic patterns:
+ * - Catch blocks: 'catch (e)' / 'catch (_e)' -> 'catch {}' (optional catch binding)
+ * - Unused imports: Removes the unused identifier or the entire import statement
+ * - Arrow callbacks: '(e) =>' / '(_e) =>' -> '() =>'
+ * - State destructuring: 'const [val, setVal] = useState' -> 'const [val] = useState'
+ *
  * @param {string} line - Source line
- * @param {string} symbol - Variable name (e.g. 'api', 'setCap')
+ * @param {string} symbol - Variable name (e.g. 'e', '_e', 'Icon', '_Icon', 'setCap')
  * @returns {string}
  */
-export function renameUnusedIdentifier(line, symbol) {
-  if (!line || !symbol || symbol.startsWith("_")) return line;
-  if (!new RegExp(`\\b${symbol}\\b`).test(line)) return line;
+export function autoFixUnusedVariable(line, symbol) {
+  if (!line || !symbol) return line;
+  const cleanSym = symbol.replace(/^_+/, "");
+  if (!cleanSym) return line;
+  const symPattern = `(?:_${cleanSym}|${cleanSym})`;
+  const symRegex = new RegExp(`\\b${symPattern}\\b`);
+  if (!symRegex.test(line)) return line;
 
-  // Check if line is an import statement: `import ... from "path"`
+  // 1. Catch block: catch (e) or catch (_e) -> optional catch binding `catch`
+  if (/catch\s*\(\s*[_a-zA-Z0-9$]*\s*\)/.test(line)) {
+    return line.replace(/catch\s*\(\s*[_a-zA-Z0-9$]+\s*\)/g, "catch");
+  }
+
+  // 2. Import statement: remove unused import
   const fromMatch = line.match(/\s+from\s+(['"][^'"]+['"])/);
   if (fromMatch) {
     const fromIdx = fromMatch.index;
     const bindings = line.slice(0, fromIdx);
     const fromAndPath = line.slice(fromIdx);
 
-    // Named import: import { api } from "../lib/api" -> import { api as _api } from "../lib/api"
+    // Named imports inside { ... }
     const namedMatch = bindings.match(/\{([^}]*)\}/);
-    if (namedMatch && new RegExp(`\\b${symbol}\\b`).test(namedMatch[1])) {
-      const newNamed = namedMatch[1].replace(
-        new RegExp(`\\b${symbol}\\b(?:\\s+as\\s+_[a-zA-Z0-9_$]+)?`, "g"),
-        `${symbol} as _${symbol}`
-      );
-      const newBindings = bindings.replace(namedMatch[0], `{${newNamed}}`);
+    if (namedMatch && symRegex.test(namedMatch[1])) {
+      const items = namedMatch[1].split(",").map((s) => s.trim()).filter(Boolean);
+      const filtered = items.filter((item) => {
+        const parts = item.split(/\s+as\s+/);
+        const originalName = parts[0].trim();
+        const aliasName = parts[1]?.trim() || originalName;
+        return (
+          originalName !== cleanSym &&
+          originalName !== `_${cleanSym}` &&
+          aliasName !== cleanSym &&
+          aliasName !== `_${cleanSym}`
+        );
+      });
+
+      if (filtered.length === 0) {
+        // All named imports removed, remove entire import line
+        return "";
+      }
+      const newBindings = bindings.replace(namedMatch[0], `{ ${filtered.join(", ")} }`);
       return newBindings + fromAndPath;
     }
 
-    // Default import: import api from "../lib/api" -> import _api from "../lib/api"
-    const newBindings = bindings.replace(new RegExp(`\\b${symbol}\\b`, "g"), `_${symbol}`);
-    return newBindings + fromAndPath;
+    // Default import: import Icon from '...' or import _Icon from '...'
+    if (symRegex.test(bindings)) {
+      return "";
+    }
   }
 
-  // Not an import statement: only replace identifier when NOT inside quotes or path slashes
+  // 3. Arrow function parameter: (e) => or (_e) => -> () =>
+  if (new RegExp(`\\(${symPattern}\\)\\s*=>`).test(line)) {
+    return line.replace(new RegExp(`\\(${symPattern}\\)\\s*=>`, "g"), "() =>");
+  }
+
+  // 4. React useState destructuring: const [cap, setCap] = useState(...)
+  const destructureMatch = line.match(/(const|let|var)\s+\[([^\]]+)\]\s*=\s*useState/);
+  if (destructureMatch) {
+    const items = destructureMatch[2].split(",").map((s) => s.trim());
+    if (items.length === 2) {
+      if (items[1] === cleanSym || items[1] === `_${cleanSym}`) {
+        // Setter is unused: const [cap, setCap] -> const [cap]
+        return line.replace(destructureMatch[0], `${destructureMatch[1]} [${items[0]}] = useState`);
+      }
+      if (items[0] === cleanSym || items[0] === `_${cleanSym}`) {
+        // Value is unused: const [cap, setCap] -> const [, setCap]
+        return line.replace(destructureMatch[0], `${destructureMatch[1]} [, ${items[1]}] = useState`);
+      }
+    }
+  }
+
+  // Fallback: prefix with _ if not an import or path
   return line.replace(
-    new RegExp(`(?<!['"/])\\b${symbol}\\b(?!['"/])`, "g"),
-    `_${symbol}`
+    new RegExp(`(?<!['"/])\\b${cleanSym}\\b(?!['"/])`, "g"),
+    `_${cleanSym}`
   );
 }
+
+export const renameUnusedIdentifier = autoFixUnusedVariable;
 
 export class DeterministicFixer {
   /**
@@ -85,20 +136,18 @@ export class DeterministicFixer {
       const msg = err.message || "";
 
       // -----------------------------------------------------------------------
-      // 1. ESLint: 'no-unused-vars' -> Safely rename unused variable without modifying paths
+      // 1. ESLint: 'no-unused-vars' -> Safely autofix unused variables / imports / catch blocks
       // -----------------------------------------------------------------------
       if (rule === "no-unused-vars" && symbol) {
-        if (!symbol.startsWith("_")) {
-          const lines = updated.split("\n");
-          if (lineNum > 0 && lineNum <= lines.length) {
-            const lineIdx = lineNum - 1;
-            const originalLine = lines[lineIdx];
-            const renamed = renameUnusedIdentifier(originalLine, symbol);
-            if (renamed !== originalLine) {
-              lines[lineIdx] = renamed;
-              updated = lines.join("\n");
-              appliedFixes.push(`Prefix unused variable '${symbol}' with '_${symbol}' on line ${lineNum}`);
-            }
+        const lines = updated.split("\n");
+        if (lineNum > 0 && lineNum <= lines.length) {
+          const lineIdx = lineNum - 1;
+          const originalLine = lines[lineIdx];
+          const fixed = autoFixUnusedVariable(originalLine, symbol);
+          if (fixed !== originalLine) {
+            lines[lineIdx] = fixed;
+            updated = lines.filter((l, idx) => idx !== lineIdx || l !== "").join("\n");
+            appliedFixes.push(`Autofixed unused variable '${symbol}' on line ${lineNum}`);
           }
         }
       }

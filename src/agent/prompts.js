@@ -7,7 +7,7 @@ Inspect the broken code snippet and return a minimal SEARCH/REPLACE diff resolvi
 
 ### REMEDIATION TAXONOMY & RULES
 1. ESLint / Linter Failures:
-   - 'no-unused-vars': Prefix unused var with underscore (e.g. 'err' -> '_err', '(req, res)' -> '(_req, res)'). Never delete functional code.
+   - 'no-unused-vars': For unused catch errors, rewrite to optional catch binding 'catch {}'. For unused imports, remove the unused import symbol. For unused parameters, drop parameter (e.g. '() =>').
    - 'no-undef': Add required import at top of file or define in scope. If using React hooks, ensure 'import React, { useState, useEffect } from "react";' is present.
    - 'react-hooks/rules-of-hooks': React hooks must ALWAYS be called inside a React function component, NEVER at top-level module scope.
    - 'prefer-const': Change 'let' to 'const' if never reassigned.
