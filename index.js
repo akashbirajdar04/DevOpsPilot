@@ -202,9 +202,14 @@ export default function healOpsApp(app, optionsOrBootTime) {
           const subPkgRaw = await fs.readFile(subPkgPath, "utf-8");
           const subPkg = JSON.parse(subPkgRaw);
           const cmds = [];
-          if (subPkg.scripts?.lint) cmds.push(`npm run lint --prefix ${targetSubDir}`);
-          if (subPkg.scripts?.test) cmds.push(`npm test --prefix ${targetSubDir}`);
-          if (subPkg.scripts?.build) cmds.push(`npm run build --prefix ${targetSubDir}`);
+          // Prioritize build & test commands over strict stylistic linters
+          if (subPkg.scripts?.build) {
+            cmds.push(`npm run build --prefix ${targetSubDir}`);
+          } else if (subPkg.scripts?.test) {
+            cmds.push(`npm test --prefix ${targetSubDir}`);
+          } else if (subPkg.scripts?.lint) {
+            cmds.push(`npm run lint --prefix ${targetSubDir}`);
+          }
           if (cmds.length > 0) {
             testCommand = cmds.join(" && ");
           } else {
@@ -214,9 +219,13 @@ export default function healOpsApp(app, optionsOrBootTime) {
           const rootPkgRaw = await fs.readFile(rootPkgPath, "utf-8");
           const rootPkg = JSON.parse(rootPkgRaw);
           const cmds = [];
-          if (rootPkg.scripts?.lint) cmds.push("npm run lint");
-          if (rootPkg.scripts?.test) cmds.push("npm test");
-          if (rootPkg.scripts?.build) cmds.push("npm run build");
+          if (rootPkg.scripts?.build) {
+            cmds.push("npm run build");
+          } else if (rootPkg.scripts?.test) {
+            cmds.push("npm test");
+          } else if (rootPkg.scripts?.lint) {
+            cmds.push("npm run lint");
+          }
           if (cmds.length > 0) {
             testCommand = cmds.join(" && ");
           } else {
