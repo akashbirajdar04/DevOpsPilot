@@ -64,12 +64,16 @@ export function cleanRawCodeOutput(rawContent) {
  */
 export function applySearchReplace(fullContent, patchText) {
   if (!fullContent || !patchText) return null;
-  const regex = /<<<<<<< SEARCH\r?\n([\s\S]*?)\r?\n=======\r?\n([\s\S]*?)\r?\n>>>>>>> REPLACE/g;
-  let updated = fullContent;
+  const isCrlf = fullContent.includes("\r\n");
+  const normalizedContent = fullContent.replace(/\r\n/g, "\n");
+  const normalizedPatch = patchText.replace(/\r\n/g, "\n");
+
+  const regex = /<<<<<<< SEARCH[^\n]*\n([\s\S]*?)\n=======[^\n]*\n([\s\S]*?)\n>>>>>>> REPLACE/g;
+  let updated = normalizedContent;
   let matches = 0;
   let m;
 
-  while ((m = regex.exec(patchText)) !== null) {
+  while ((m = regex.exec(normalizedPatch)) !== null) {
     const search = m[1];
     const replace = m[2];
     if (updated.includes(search)) {
@@ -78,10 +82,54 @@ export function applySearchReplace(fullContent, patchText) {
     } else if (updated.includes(search.trim())) {
       updated = updated.replace(search.trim(), replace.trim());
       matches++;
+    } else {
+      // Fuzzy line match ignoring leading/trailing whitespace
+      const searchLines = search.split("\n").map((l) => l.trim()).filter(Boolean);
+      if (searchLines.length > 0) {
+        const contentLines = updated.split("\n");
+        let foundIdx = -1;
+        for (let i = 0; i <= contentLines.length - searchLines.length; i++) {
+          const slice = contentLines.slice(i, i + searchLines.length).map((l) => l.trim());
+          if (slice.every((line, idx) => line === searchLines[idx])) {
+            foundIdx = i;
+            break;
+          }
+        }
+        if (foundIdx !== -1) {
+          const indent = contentLines[foundIdx].match(/^\s*/)?.[0] || "";
+          const indentedReplace = replace
+            .split("\n")
+            .map((l, idx) => (idx === 0 ? indent + l.trimStart() : l))
+            .join("\n");
+          contentLines.splice(foundIdx, searchLines.length, indentedReplace);
+          updated = contentLines.join("\n");
+          matches++;
+        }
+      }
     }
   }
 
-  return matches > 0 ? updated : null;
+  if (matches > 0) {
+    return isCrlf ? updated.replace(/\n/g, "\r\n") : updated;
+  }
+  return null;
+}
+
+/**
+ * Extract replace blocks from diff-style output.
+ * @param {string} patchText
+ * @returns {string[]}
+ */
+export function extractReplaceBlocks(patchText) {
+  if (!patchText) return [];
+  const normalized = patchText.replace(/\r\n/g, "\n");
+  const regex = /<<<<<<< SEARCH[^\n]*\n([\s\S]*?)\n=======[^\n]*\n([\s\S]*?)\n>>>>>>> REPLACE/g;
+  const blocks = [];
+  let m;
+  while ((m = regex.exec(normalized)) !== null) {
+    blocks.push(m[2]);
+  }
+  return blocks;
 }
 
 
@@ -386,6 +434,14 @@ export class DiagnoserAgent {
         const searchReplaced = applySearchReplace(fullContent, cleaned);
         if (searchReplaced) {
           finalCode = searchReplaced;
+        } else if (cleaned.includes("<<<<<<< SEARCH") || cleaned.includes("=======")) {
+          const replaceBlocks = extractReplaceBlocks(cleaned);
+          if (replaceBlocks.length > 0 && snippet && fullContent.includes(snippet)) {
+            finalCode = fullContent.replace(snippet, replaceBlocks[0]);
+          } else {
+            this.logger.warn(`Could not safely match diff markers for '${targetFile}'. Skipping.`);
+            continue;
+          }
         } else if (isFullFile) {
           finalCode = cleaned;
         } else {
@@ -397,6 +453,12 @@ export class DiagnoserAgent {
               finalCode = cleaned;
             }
           }
+        }
+
+        // Safety guard: Never write raw conflict markers into source code
+        if (finalCode.includes("<<<<<<< SEARCH") || finalCode.includes(">>>>>>> REPLACE")) {
+          this.logger.warn(`Conflict markers detected in output for '${targetFile}'. Skipping to protect file.`);
+          continue;
         }
 
         await this.tools.applyFilePatch(targetFile, finalCode);
