@@ -154,10 +154,14 @@ export default function healOpsApp(app, optionsOrBootTime) {
 
       try {
         app.log.info(`Installing dependencies in sandbox (${installCwd})...`);
-        await execa(`npm ci --prefer-offline || npm install --prefer-offline`, {
+        await execa(`npm install --include=dev --prefer-offline`, {
           cwd: installCwd,
           shell: true,
-          timeout: 120000,
+          env: {
+            ...process.env,
+            NODE_ENV: "development",
+          },
+          timeout: 180000,
         });
       } catch (npmErr) {
         app.log.warn(`Sandbox dependency install note: ${npmErr.message}`);

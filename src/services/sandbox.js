@@ -50,6 +50,7 @@ export class Sandbox {
         reject: false,
         env: {
           ...process.env,
+          NODE_ENV: "test",
           CI: "true",
           ...options.env,
         },
