@@ -88,15 +88,28 @@ export function applySearchReplace(fullContent, patchText) {
   while ((m = regex.exec(normalizedPatch)) !== null) {
     const search = m[1];
     const replace = m[2];
+    const strippedSearch = search.replace(/^\s*\d+:\s*/gm, "");
+    const strippedReplace = replace.replace(/^\s*\d+:\s*/gm, "");
+
     if (updated.includes(search)) {
       updated = updated.replace(search, replace);
+      matches++;
+    } else if (updated.includes(strippedSearch)) {
+      updated = updated.replace(strippedSearch, strippedReplace);
       matches++;
     } else if (updated.includes(search.trim())) {
       updated = updated.replace(search.trim(), replace.trim());
       matches++;
+    } else if (updated.includes(strippedSearch.trim())) {
+      updated = updated.replace(strippedSearch.trim(), strippedReplace.trim());
+      matches++;
     } else {
-      // Fuzzy line match ignoring leading/trailing whitespace
-      const searchLines = search.split("\n").map((l) => l.trim()).filter(Boolean);
+      // Fuzzy line match ignoring leading/trailing whitespace and line numbers
+      const searchLines = (strippedSearch || search)
+        .split("\n")
+        .map((l) => l.replace(/^\s*\d+:\s*/, "").trim())
+        .filter(Boolean);
+
       if (searchLines.length > 0) {
         const contentLines = updated.split("\n");
         let foundIdx = -1;
@@ -109,7 +122,7 @@ export function applySearchReplace(fullContent, patchText) {
         }
         if (foundIdx !== -1) {
           const indent = contentLines[foundIdx].match(/^\s*/)?.[0] || "";
-          const indentedReplace = replace
+          const indentedReplace = strippedReplace
             .split("\n")
             .map((l, idx) => (idx === 0 ? indent + l.trimStart() : l))
             .join("\n");
@@ -392,6 +405,7 @@ export class DiagnoserAgent {
 
     // Fast verification: did deterministic auto-fixes resolve all failures?
     let preCheckPassed = false;
+    let preCheckErrorOutput = "";
     try {
       this.logger.info(`Executing fast verification check: '${testCommand}'...`);
       const preCheckJson = await this.tools.runSandboxTest(testCommand);
@@ -408,14 +422,25 @@ export class DiagnoserAgent {
           iterations: 1,
         };
       }
-    } catch {
-      // Continue to LLM remediation for residual files
+      preCheckErrorOutput = (preCheck.stderr || preCheck.stdout || "").trim();
+    } catch (err) {
+      preCheckErrorOutput = err.message || "";
     }
 
     // -------------------------------------------------------------------------
     // Phase 2: Token-Budgeted LLM Pipeline for Residual Files
     // -------------------------------------------------------------------------
-    const targetsToFix = culprits.filter((c) => residualFiles.includes(c.targetFile) || !preCheckPassed);
+    // Only target files that genuinely failed deterministic fix or appear in compiler error output
+    const targetsToFix = culprits.filter((c) => {
+      if (residualFiles.includes(c.targetFile)) return true;
+      if (preCheckErrorOutput) {
+        const baseName = c.targetFile.split("/").pop();
+        if (preCheckErrorOutput.includes(c.targetFile) || preCheckErrorOutput.includes(baseName)) {
+          return true;
+        }
+      }
+      return false;
+    });
     const maxFiles = Math.min(targetsToFix.length, 15);
 
     if (maxFiles > 0) {

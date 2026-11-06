@@ -29,7 +29,7 @@ import {
   buildRemediationUserPrompt,
 } from "../src/agent/diagnoser.js";
 import { RunLock } from "../src/utils/runLock.js";
-import { DeterministicFixer } from "../src/services/deterministicFixer.js";
+import { DeterministicFixer, renameUnusedIdentifier } from "../src/services/deterministicFixer.js";
 import {
   validatePatchOutput,
   validateModifiedFile,
@@ -609,6 +609,13 @@ test("DeterministicFixer: fixes unused vars, missing React imports, and relocate
     assert.equal(fixedContent.includes("_setCap"), true);
     // 3. Hook relocated inside function
     assert.equal(fixedContent.includes("export default function UserProfile() {\n  const [cap, _setCap] = useState(0);"), true);
+
+    // 4. Safe import renaming (never corrupts path specifier)
+    const namedImportLine = 'import { api } from "../lib/api";';
+    assert.equal(renameUnusedIdentifier(namedImportLine, "api"), 'import { api as _api } from "../lib/api";');
+
+    const defaultImportLine = 'import api from "../lib/api";';
+    assert.equal(renameUnusedIdentifier(defaultImportLine, "api"), 'import _api from "../lib/api";');
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }

@@ -7,6 +7,46 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+/**
+ * Safely rename an unused variable in a code line without modifying import paths, string literals, or properties.
+ * @param {string} line - Source line
+ * @param {string} symbol - Variable name (e.g. 'api', 'setCap')
+ * @returns {string}
+ */
+export function renameUnusedIdentifier(line, symbol) {
+  if (!line || !symbol || symbol.startsWith("_")) return line;
+  if (!new RegExp(`\\b${symbol}\\b`).test(line)) return line;
+
+  // Check if line is an import statement: `import ... from "path"`
+  const fromMatch = line.match(/\s+from\s+(['"][^'"]+['"])/);
+  if (fromMatch) {
+    const fromIdx = fromMatch.index;
+    const bindings = line.slice(0, fromIdx);
+    const fromAndPath = line.slice(fromIdx);
+
+    // Named import: import { api } from "../lib/api" -> import { api as _api } from "../lib/api"
+    const namedMatch = bindings.match(/\{([^}]*)\}/);
+    if (namedMatch && new RegExp(`\\b${symbol}\\b`).test(namedMatch[1])) {
+      const newNamed = namedMatch[1].replace(
+        new RegExp(`\\b${symbol}\\b(?:\\s+as\\s+_[a-zA-Z0-9_$]+)?`, "g"),
+        `${symbol} as _${symbol}`
+      );
+      const newBindings = bindings.replace(namedMatch[0], `{${newNamed}}`);
+      return newBindings + fromAndPath;
+    }
+
+    // Default import: import api from "../lib/api" -> import _api from "../lib/api"
+    const newBindings = bindings.replace(new RegExp(`\\b${symbol}\\b`, "g"), `_${symbol}`);
+    return newBindings + fromAndPath;
+  }
+
+  // Not an import statement: only replace identifier when NOT inside quotes or path slashes
+  return line.replace(
+    new RegExp(`(?<!['"/])\\b${symbol}\\b(?!['"/])`, "g"),
+    `_${symbol}`
+  );
+}
+
 export class DeterministicFixer {
   /**
    * @param {object} params
@@ -45,7 +85,7 @@ export class DeterministicFixer {
       const msg = err.message || "";
 
       // -----------------------------------------------------------------------
-      // 1. ESLint: 'no-unused-vars' -> Prefix unused variable with underscore
+      // 1. ESLint: 'no-unused-vars' -> Safely rename unused variable without modifying paths
       // -----------------------------------------------------------------------
       if (rule === "no-unused-vars" && symbol) {
         if (!symbol.startsWith("_")) {
@@ -53,10 +93,9 @@ export class DeterministicFixer {
           if (lineNum > 0 && lineNum <= lines.length) {
             const lineIdx = lineNum - 1;
             const originalLine = lines[lineIdx];
-            // Match symbol as whole identifier avoiding already prefixed or properties
-            const identRegex = new RegExp(`\\b${symbol}\\b`, "g");
-            if (identRegex.test(originalLine)) {
-              lines[lineIdx] = originalLine.replace(identRegex, `_${symbol}`);
+            const renamed = renameUnusedIdentifier(originalLine, symbol);
+            if (renamed !== originalLine) {
+              lines[lineIdx] = renamed;
               updated = lines.join("\n");
               appliedFixes.push(`Prefix unused variable '${symbol}' with '_${symbol}' on line ${lineNum}`);
             }
