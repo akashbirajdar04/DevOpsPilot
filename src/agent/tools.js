@@ -232,8 +232,10 @@ export class AgentTools {
       status: result.exitCode === 0 ? "PASSED (Exit code: 0)" : `FAILED (Exit code: ${result.exitCode})`,
       exitCode: result.exitCode,
       timedOut: result.timedOut,
-      stdout: (result.stdout.slice(-1500) + note).trim(),
-      stderr: result.stderr.slice(-1500),
+      stdout: (result.stdout + note).trim(),
+      stderr: result.stderr.trim(),
+      fullStdout: result.stdout || "",
+      fullStderr: result.stderr || "",
       durationMs: result.durationMs,
     });
   }

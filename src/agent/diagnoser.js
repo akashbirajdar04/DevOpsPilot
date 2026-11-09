@@ -516,6 +516,156 @@ export function extractReplaceBlocks(patchText) {
   return [];
 }
 
+/**
+ * Execute multi-stage verification pipeline inside the sandbox workspace:
+ * Decomposes compound commands (e.g. `npm run lint --prefix frontend && npm run build --prefix frontend`)
+ * into independent stages (lint, build, test, etc.).
+ * Runs lint and parses structured diagnostics (JSON format when supported or text table format).
+ * Runs build independently even if lint fails, recording both exit codes and complete outputs.
+ * Classifies overall outcome: 'PASSED', 'LINT_FAILURE', 'BUILD_FAILURE', 'LINT_AND_BUILD_FAILURE', 'TEST_FAILURE'.
+ *
+ * @param {import("./tools.js").AgentTools} tools
+ * @param {string} testCommand
+ * @param {object} [logger=console]
+ * @returns {Promise<{ overallPassed: boolean, classification: string, stages: Array<object>, summary: string, failureOutput: string, testCommand: string, exitCode: number }>}
+ */
+export async function runVerificationPipeline(tools, testCommand, logger = console) {
+  if (!testCommand || typeof testCommand !== "string") {
+    return {
+      overallPassed: true,
+      classification: "PASSED",
+      stages: [],
+      summary: "No verification command specified.",
+      failureOutput: "",
+      testCommand: "",
+      exitCode: 0,
+    };
+  }
+
+  // Decompose compound commands chained with &&
+  const subCommands = testCommand.includes(" && ")
+    ? testCommand.split(/\s*&&\s*/).map((s) => s.trim()).filter(Boolean)
+    : [testCommand.trim()];
+
+  const stages = [];
+
+  for (const cmd of subCommands) {
+    let stageType = "generic";
+    if (/\blint\b/i.test(cmd)) stageType = "lint";
+    else if (/\bbuild\b/i.test(cmd)) stageType = "build";
+    else if (/\btest\b/i.test(cmd)) stageType = "test";
+
+    logger.info?.(`[Pipeline] Running ${stageType.toUpperCase()} stage: '${cmd}'...`);
+
+    let rawResult = null;
+
+    // For lint commands, first attempt JSON format if supported
+    if (stageType === "lint") {
+      try {
+        const jsonCommand = `${cmd} -- --format json`;
+        const jsonExec = await tools.runSandboxTest(jsonCommand);
+        const parsedJsonExec = JSON.parse(jsonExec);
+        const stdoutTrim = (parsedJsonExec.stdout || "").trim();
+        if (stdoutTrim.includes("[") && stdoutTrim.includes("]")) {
+          const jsonDiag = extractVerificationDiagnostics(stdoutTrim, parsedJsonExec.exitCode, tools.repo || "");
+          if (jsonDiag.errorCount > 0 || jsonDiag.warningCount > 0) {
+            rawResult = parsedJsonExec;
+            stages.push({
+              stage: stageType,
+              command: cmd,
+              exitCode: parsedJsonExec.exitCode,
+              stdout: parsedJsonExec.stdout || "",
+              stderr: parsedJsonExec.stderr || "",
+              diagnostics: jsonDiag,
+              passed: jsonDiag.passed,
+            });
+            continue;
+          }
+        }
+      } catch {
+        // Fall back to standard command execution
+      }
+    }
+
+    try {
+      const rawResultJson = await tools.runSandboxTest(cmd);
+      rawResult = JSON.parse(rawResultJson);
+    } catch (execErr) {
+      rawResult = {
+        exitCode: 1,
+        stdout: "",
+        stderr: execErr.message || "Command execution failed.",
+      };
+    }
+
+    const output = ((rawResult.stdout || "") + "\n" + (rawResult.stderr || "")).trim();
+    const diag = extractVerificationDiagnostics(output, rawResult.exitCode, tools.repo || "");
+
+    stages.push({
+      stage: stageType,
+      command: cmd,
+      exitCode: rawResult.exitCode,
+      stdout: rawResult.stdout || "",
+      stderr: rawResult.stderr || "",
+      diagnostics: diag,
+      passed: diag.passed,
+    });
+  }
+
+  const lintStage = stages.find((s) => s.stage === "lint");
+  const buildStage = stages.find((s) => s.stage === "build");
+  const lintFailed = lintStage ? !lintStage.passed : false;
+  const buildFailed = buildStage ? !buildStage.passed : false;
+  const anyFailed = stages.some((s) => !s.passed);
+
+  let classification = "PASSED";
+  if (lintFailed && buildFailed) {
+    classification = "LINT_AND_BUILD_FAILURE";
+  } else if (lintFailed) {
+    classification = "LINT_FAILURE";
+  } else if (buildFailed) {
+    classification = "BUILD_FAILURE";
+  } else if (anyFailed) {
+    classification = "TEST_FAILURE";
+  }
+
+  const overallPassed = !anyFailed;
+
+  let summary = "";
+  if (overallPassed) {
+    const totalWarnings = stages.reduce((sum, s) => sum + (s.diagnostics?.warningCount || 0), 0);
+    summary = totalWarnings > 0
+      ? `✅ Verification passed across all ${stages.length} stage(s) (${totalWarnings} warnings reported).`
+      : `✅ Verification passed cleanly across all ${stages.length} stage(s).`;
+  } else {
+    summary = `❌ Verification failed (${classification}):\n` +
+      stages
+        .map((s) => {
+          const icon = s.passed ? "✅" : "❌";
+          const statusText = s.passed ? "PASSED" : `FAILED (exit code ${s.exitCode})`;
+          return `${icon} Stage [${s.stage.toUpperCase()}] '${s.command}': ${statusText}\n  ${s.diagnostics.summary.split("\n").join("\n  ")}`;
+        })
+        .join("\n");
+  }
+
+  const failureOutput = stages
+    .filter((s) => !s.passed)
+    .map((s) => `--- Stage [${s.stage.toUpperCase()}] '${s.command}' (exit code ${s.exitCode}) ---\n${s.stderr || s.stdout || s.diagnostics.summary}`)
+    .join("\n\n");
+
+  const overallExitCode = stages.find((s) => !s.passed)?.exitCode || (overallPassed ? 0 : 1);
+
+  return {
+    overallPassed,
+    classification,
+    stages,
+    summary,
+    failureOutput: failureOutput || summary,
+    testCommand,
+    exitCode: overallExitCode,
+  };
+}
+
 
 export class DiagnoserAgent {
   /**
@@ -675,12 +825,11 @@ export class DiagnoserAgent {
     // 2. Overwrite target file with returned code
     await this.tools.applyFilePatch(targetFile, fixedCode);
 
-    // 3. Run workspace test/build command once
-    this.logger.info(`Executing single-shot verification command: '${testCommand}'...`);
-    const testResultJson = await this.tools.runSandboxTest(testCommand);
-    const testResult = JSON.parse(testResultJson);
+    // 3. Run multi-stage workspace verification pipeline
+    this.logger.info(`Executing single-shot verification pipeline: '${testCommand}'...`);
+    const pipelineResult = await runVerificationPipeline(this.tools, testCommand, this.logger);
 
-    if (testResult.exitCode === 0) {
+    if (pipelineResult.overallPassed) {
       this.logger.info(`✅ Single-shot verification passed on '${targetFile}'!`);
       return {
         success: true,
@@ -688,14 +837,12 @@ export class DiagnoserAgent {
         modifiedFiles: [targetFile],
         fixedCode,
         testCommand,
-        testOutput: testResult.stdout || "Verification test passed with exit code 0.",
+        testOutput: pipelineResult.summary,
         iterations: 1,
       };
     } else {
-      const failureOutput = (testResult.stderr || testResult.stdout || "").trim();
-      const diag = extractVerificationDiagnostics(failureOutput, testResult.exitCode);
       this.logger.warn(
-        `❌ Single-shot remediation was unsuccessful (exit code: ${testResult.exitCode}).\nCommand: '${testCommand}'\n${diag.summary}\nRolling back unverified changes...`
+        `❌ Single-shot remediation was unsuccessful (${pipelineResult.classification}, exit code: ${pipelineResult.exitCode}).\nCommand: '${testCommand}'\n${pipelineResult.summary}\nRolling back unverified changes...`
       );
       if (originalContent && !originalContent.startsWith("Error:")) {
         await this.tools.applyFilePatch(targetFile, originalContent);
@@ -703,11 +850,11 @@ export class DiagnoserAgent {
       }
       return {
         success: false,
-        rootCause: `Single-shot remediation failed verification in \`${targetFile}\`:\n${diag.summary}`,
+        rootCause: `Single-shot remediation failed verification in \`${targetFile}\` (${pipelineResult.classification}):\n${pipelineResult.summary}`,
         modifiedFiles: [],
         fixedCode,
         testCommand,
-        testOutput: failureOutput || `Failed with exit code ${testResult.exitCode}`,
+        testOutput: pipelineResult.failureOutput,
         iterations: 1,
       };
     }
@@ -771,37 +918,50 @@ export class DiagnoserAgent {
     }
 
     // Fast verification: did deterministic auto-fixes resolve all failures?
-    let preCheckPassed = false;
-    let preCheckErrorOutput = "";
+    let preCheck = null;
     try {
-      this.logger.info(`Executing fast verification check: '${testCommand}'...`);
-      const preCheckJson = await this.tools.runSandboxTest(testCommand);
-      const preCheck = JSON.parse(preCheckJson);
-      if (preCheck.exitCode === 0 && modifiedFiles.length > 0) {
-        preCheckPassed = true;
+      this.logger.info(`Executing fast verification pipeline: '${testCommand}'...`);
+      preCheck = await runVerificationPipeline(this.tools, testCommand, this.logger);
+      if (preCheck.overallPassed && modifiedFiles.length > 0) {
         this.logger.info(`🎉 All CI issues resolved deterministically in sandbox! Total LLM tokens used: 0.`);
         return {
           success: true,
           rootCause: `Automated deterministic remediation resolved errors across ${modifiedFiles.length} file(s) with 0 LLM tokens:\n${rootCauses.join("\n")}`,
           modifiedFiles,
           testCommand,
-          testOutput: preCheck.stdout || "Verification passed cleanly with exit code 0.",
+          testOutput: preCheck.summary,
           iterations: 1,
         };
       }
-      preCheckErrorOutput = (preCheck.stderr || preCheck.stdout || "").trim();
     } catch (err) {
-      preCheckErrorOutput = err.message || "";
+      this.logger.warn(`Pre-check pipeline error: ${err.message}`);
     }
 
     // -------------------------------------------------------------------------
     // Phase 2: Token-Budgeted LLM Pipeline for Residual Files
     // -------------------------------------------------------------------------
-    // Re-diagnose fresh errors on the actual post-deterministic sandbox output!
+    // Extract fatal errors from preCheck stages if available
     let targetsToFix = [];
+    if (preCheck && !preCheck.overallPassed) {
+      const lintStage = preCheck.stages.find((s) => s.stage === "lint");
+      const fatalErrors = lintStage?.diagnostics?.fatalErrors || [];
+      if (fatalErrors.length > 0) {
+        const byFileFresh = new Map();
+        for (const err of fatalErrors) {
+          if (!byFileFresh.has(err.filePath)) byFileFresh.set(err.filePath, []);
+          byFileFresh.get(err.filePath).push(err);
+        }
+        targetsToFix = Array.from(byFileFresh.entries()).map(([targetFile, errs]) => ({
+          targetFile,
+          lineNum: errs[0].line || 1,
+          errors: errs.map((e) => e.message || e.raw),
+          structuredErrors: errs,
+        }));
+      }
+    }
 
-    if (preCheckErrorOutput) {
-      const freshDiag = diagnoseLogErrors(preCheckErrorOutput, this.tools.repo || "");
+    if (targetsToFix.length === 0 && preCheck?.failureOutput) {
+      const freshDiag = diagnoseLogErrors(preCheck.failureOutput, this.tools.repo || "");
       if (freshDiag.byFile && freshDiag.byFile.size > 0) {
         this.logger.info(
           `🔄 Re-diagnosed sandbox failure: ${freshDiag.errors.length} residual error(s) across ${freshDiag.byFile.size} file(s).`
@@ -819,9 +979,9 @@ export class DiagnoserAgent {
     if (targetsToFix.length === 0) {
       targetsToFix = culprits.filter((c) => {
         if (residualFiles.includes(c.targetFile)) return true;
-        if (preCheckErrorOutput) {
+        if (preCheck?.failureOutput) {
           const baseName = c.targetFile.split("/").pop();
-          if (preCheckErrorOutput.includes(c.targetFile) || preCheckErrorOutput.includes(baseName)) {
+          if (preCheck.failureOutput.includes(c.targetFile) || preCheck.failureOutput.includes(baseName)) {
             return true;
           }
         }
@@ -840,9 +1000,24 @@ export class DiagnoserAgent {
     for (let i = 0; i < maxFiles; i++) {
       const culprit = targetsToFix[i];
       const targetFile = culprit.targetFile;
-      const errorText = Array.isArray(culprit.errors) && culprit.errors.length > 0
-        ? culprit.errors.slice(0, 3).join("\n")
-        : `CI failure at line ${culprit.lineNum}`;
+      const fatalErrors = (culprit.structuredErrors || []).filter((e) => e.severity === "error");
+      let errorText = "";
+      if (fatalErrors.length > 0) {
+        errorText = fatalErrors.map((e) => e.message || e.raw).slice(0, 3).join("\n");
+      } else if (Array.isArray(culprit.errors) && culprit.errors.length > 0) {
+        errorText = culprit.errors.slice(0, 3).join("\n");
+      } else {
+        errorText = `CI failure at line ${culprit.lineNum}`;
+      }
+
+      const primaryErr =
+        culprit.structuredErrors?.find((e) => e.severity === "error") ||
+        culprit.structuredErrors?.[0] ||
+        null;
+      const ruleId = primaryErr?.rule || primaryErr?.ruleId || "";
+      const lineNum = primaryErr?.lineNum || primaryErr?.line || culprit.lineNum || 1;
+      const colNum = primaryErr?.colNum || primaryErr?.column || null;
+      const tool = primaryErr?.category || "eslint";
 
       try {
         const fullContent = await this.tools.getRepoFile(targetFile);
@@ -877,7 +1052,9 @@ export class DiagnoserAgent {
           targetSnippet = targetSnippet.slice(0, 4500);
         }
 
-        this.logger.info(`[${i + 1}/${maxFiles}] [Groq (${this.model})] Patching '${targetFile}' (${culprit.errors?.length || 1} error(s))...`);
+        this.logger.info(
+          `[${i + 1}/${maxFiles}] [Groq (${this.model})] Patching '${targetFile}' (Rule: ${ruleId || "error"}, Line: ${lineNum})...`
+        );
 
         const prompt = buildRemediationUserPrompt({
           filePath: targetFile,
@@ -885,6 +1062,10 @@ export class DiagnoserAgent {
           lineWindowSnippet: targetSnippet,
           enclosingScope,
           topImports,
+          ruleId,
+          lineNum,
+          colNum,
+          tool,
         });
 
         let completion;
@@ -1032,25 +1213,22 @@ export class DiagnoserAgent {
       }
     }
 
-    this.logger.info(`Executing verification command on all ${modifiedFiles.length} patched file(s): '${testCommand}'...`);
-    const testResultJson = await this.tools.runSandboxTest(testCommand);
-    const testResult = JSON.parse(testResultJson);
+    this.logger.info(`Executing verification pipeline across all ${modifiedFiles.length} patched file(s): '${testCommand}'...`);
+    const finalPipeline = await runVerificationPipeline(this.tools, testCommand, this.logger);
 
-    if (testResult.exitCode === 0) {
+    if (finalPipeline.overallPassed) {
       this.logger.info(`✅ Multi-file verification passed for ${modifiedFiles.length} file(s)!`);
       return {
         success: true,
         rootCause: `Automated remediation resolved errors across ${modifiedFiles.length} file(s):\n${rootCauses.join("\n")}`,
         modifiedFiles,
         testCommand,
-        testOutput: testResult.stdout || "Verification test passed with exit code 0.",
+        testOutput: finalPipeline.summary,
         iterations: 1,
       };
     } else {
-      const failureOutput = (testResult.stderr || testResult.stdout || "").trim();
-      const diag = extractVerificationDiagnostics(failureOutput, testResult.exitCode);
       this.logger.error(
-        `❌ Multi-file remediation failed verification (exit code: ${testResult.exitCode}).\nCommand: '${testCommand}'\n${diag.summary}\nFull verification output:\n${failureOutput}`
+        `❌ Multi-file remediation failed verification (${finalPipeline.classification}, exit code: ${finalPipeline.exitCode}).\nCommand: '${testCommand}'\n${finalPipeline.summary}\nFull verification output:\n${finalPipeline.failureOutput}`
       );
 
       // Atomic Rollback: Revert all files modified in Phase 2 so sandbox is not left corrupted
@@ -1065,10 +1243,10 @@ export class DiagnoserAgent {
 
       return {
         success: false,
-        rootCause: `Remediation failed verification across ${modifiedFiles.length} file(s). Rolled back candidate edits.`,
+        rootCause: `Remediation failed verification across ${modifiedFiles.length} file(s) (${finalPipeline.classification}). Rolled back candidate edits.`,
         modifiedFiles: repairedFiles,
         testCommand,
-        testOutput: failureOutput,
+        testOutput: finalPipeline.failureOutput,
         iterations: 1,
       };
     }

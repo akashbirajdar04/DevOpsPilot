@@ -7,11 +7,11 @@ Inspect the broken code snippet and return a minimal SEARCH/REPLACE diff resolvi
 
 ### REMEDIATION TAXONOMY & RULES
 1. ESLint / Linter Failures:
-   - 'no-unused-vars': For unused catch parameters, ALWAYS rewrite to optional catch binding 'catch {}'. NEVER rename the parameter to '_e' or '_err'. For unused imports, remove the unused import specifier; if no specifiers remain, remove the entire import statement. For unused parameters, drop parameter (e.g. '() =>'). Never rename identifiers in module import paths.
+   - 'no-unused-vars': For unused catch params, rewrite to optional catch 'catch {}'. Never rename to '_e'/'_err'. For unused imports, remove specifier or entire import. For unused params, drop param ('() =>'). Never rename module import paths.
    - 'no-undef': Add required import at top of file or define in scope. If using React hooks, ensure 'import React, { useState, useEffect } from "react";' is present.
-   - 'react-hooks/rules-of-hooks': React hooks must ALWAYS be called inside a React function component or custom hook, NEVER at top-level module scope.
+   - 'react-hooks/rules-of-hooks': Hooks must be called inside React components/custom hooks, never at top-level module scope or conditionally.
    - 'prefer-const': Change 'let' to 'const' if never reassigned.
-   - 'react-hooks/exhaustive-deps': Add missing dependency to hook dependency array or memoize callback.
+   - 'react-hooks/exhaustive-deps': For props/state primitives (e.g. 'senderid'), add to hook dependency array. For helper functions (e.g. 'fetchPolls'): wrap in 'useCallback' or move inside 'useEffect' to avoid infinite loops; do not blindly add recreated functions. Never use eslint-disable. Respect Rules of Hooks.
 2. Syntax & Modern ECMAScript / TypeScript:
    - Optional Catch Binding: Rewrite 'catch (e)' or 'catch (err)' to ECMAScript standard 'catch {}'.
    - Type Mismatches (TS2322, TS2345): Update type annotations, add null/undefined guards ('?.').
@@ -41,6 +41,10 @@ export function buildRemediationUserPrompt({
   lineWindowSnippet,
   enclosingScope = "",
   topImports = "",
+  ruleId = "",
+  lineNum = null,
+  colNum = null,
+  tool = "eslint",
 }) {
   let contextBlock = "";
   if (topImports) {
@@ -50,8 +54,11 @@ export function buildRemediationUserPrompt({
     contextBlock += `Enclosing Scope:\n${enclosingScope}\n\n`;
   }
 
-  return `Target File: ${filePath}
-Failure Diagnostics:
+  const loc = lineNum ? ` (line ${lineNum}${colNum ? `:${colNum}` : ""})` : "";
+  const meta = ruleId ? `Tool: ${tool} | Rule: ${ruleId}\n` : "";
+
+  return `Target File: ${filePath}${loc}
+${meta}Failure Diagnostics:
 ${errorMessage}
 
 ${contextBlock}Code Context (centered on error line):

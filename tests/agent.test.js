@@ -18,6 +18,7 @@ import {
   extractCodeContext,
   diagnoseLogErrors,
   extractVerificationDiagnostics,
+  parseESLintJson,
 } from "../src/services/logParser.js";
 import { Sandbox } from "../src/services/sandbox.js";
 import { AgentTools } from "../src/agent/tools.js";
@@ -28,6 +29,7 @@ import {
   applySearchReplace,
   applySearchReplaceDetailed,
   parseSearchReplaceBlocks,
+  runVerificationPipeline,
   applyUnifiedDiff,
   isTruncatedCode,
   SRE_SYSTEM_PROMPT,
@@ -1462,6 +1464,362 @@ test("Regression 10: Atomic rollback reverts modified files when sandbox verific
     const diskApp = await tools.getRepoFile("App.jsx");
     assert.equal(diskWidget, originalWidget);
     assert.equal(diskApp, originalApp);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+// =========================================================================
+// Task 8: Verification Policy, Error Classification & React Hook Remediation Tests
+// =========================================================================
+
+test("Task 8.1: Zero errors and zero warnings passes verification", () => {
+  const cleanLog = "✔ No ESLint warnings or errors\n";
+  const diag = extractVerificationDiagnostics(cleanLog, 0);
+  assert.equal(diag.passed, true);
+  assert.equal(diag.errorCount, 0);
+  assert.equal(diag.warningCount, 0);
+  assert.equal(diag.fatalErrors.length, 0);
+  assert.match(diag.summary, /passed cleanly/i);
+});
+
+test("Task 8.2: Zero errors and multiple warnings passes lint stage and reports warnings", () => {
+  const warningsOnlyLog = [
+    "frontend/src/components/hostel/hostelprofile.jsx",
+    "  36:10  warning  'user' is defined but never used                no-unused-vars",
+    "  42:8   warning  React Hook useEffect has a missing dependency   react-hooks/exhaustive-deps",
+    "",
+    "✖ 20 problems (0 errors, 20 warnings)",
+  ].join("\n");
+
+  const diag = extractVerificationDiagnostics(warningsOnlyLog, 0);
+  // Standard ESLint policy: 0 errors with exit code 0 passes!
+  assert.equal(diag.passed, true);
+  assert.equal(diag.errorCount, 0);
+  assert.equal(diag.warningCount, 20);
+  assert.equal(diag.fatalErrors.length, 0);
+  assert.match(diag.summary, /passed cleanly.*20 warnings reported/i);
+});
+
+test("Task 8.3: One error and multiple warnings fails lint stage", () => {
+  const mixedLog = [
+    "frontend/src/components/user/req.jsx",
+    "  15:7   error    'handleSubmit' is not defined                   no-undef",
+    "  42:8   warning  React Hook useEffect has a missing dependency   react-hooks/exhaustive-deps",
+    "",
+    "✖ 21 problems (1 error, 20 warnings)",
+  ].join("\n");
+
+  const diag = extractVerificationDiagnostics(mixedLog, 1);
+  assert.equal(diag.passed, false);
+  assert.equal(diag.errorCount, 1);
+  assert.equal(diag.warningCount, 20);
+  assert.equal(diag.fatalErrors.length, 1);
+  assert.equal(diag.fatalErrors[0].ruleId, "no-undef");
+  assert.equal(diag.fatalErrors[0].message, "'handleSubmit' is not defined");
+  assert.match(diag.summary, /failed \(exit code 1\) due to 1 fatal error/i);
+});
+
+test("Task 8.4: Multiple ESLint errors across multiple files", () => {
+  const multiErrorLog = [
+    "frontend/src/components/user/req.jsx",
+    "  15:7   error    'handleSubmit' is not defined  no-undef",
+    "  20:3   error    'token' is not defined         no-undef",
+    "",
+    "frontend/src/components/hostel/hostel.jsx",
+    "  10:5   error    'id' is not defined            no-undef",
+    "  36:10  warning  'user' is defined but never used no-unused-vars",
+    "",
+    "✖ 4 problems (3 errors, 1 warning)",
+  ].join("\n");
+
+  const diag = extractVerificationDiagnostics(multiErrorLog, 1);
+  assert.equal(diag.passed, false);
+  assert.equal(diag.errorCount, 3);
+  assert.equal(diag.warningCount, 1);
+  assert.equal(diag.fatalErrors.length, 3);
+  assert.match(diag.summary, /due to 3 fatal error/i);
+});
+
+test("Task 8.5: React Hook missing dependency warning classification & prompt context", () => {
+  const hookLog = [
+    "frontend/src/components/user/req.jsx",
+    "  14:5  warning  React Hook useEffect has a missing dependency: 'senderid'. Either include it or remove the dependency array  react-hooks/exhaustive-deps",
+  ].join("\n");
+
+  const diag = extractVerificationDiagnostics(hookLog, 0);
+  assert.equal(diag.warnings.length, 1);
+  assert.equal(diag.fatalErrors.length, 0);
+  assert.equal(diag.warnings[0].ruleId, "react-hooks/exhaustive-deps");
+  assert.equal(diag.warnings[0].severity, "warning");
+
+  // Verify prompt builder attaches ruleId, line, and does not emit blind dependency rewrite
+  const prompt = buildRemediationUserPrompt({
+    filePath: "frontend/src/components/user/req.jsx",
+    errorMessage: diag.warnings[0].message,
+    lineWindowSnippet: "useEffect(() => { fetchRequests(senderid); }, []);",
+    enclosingScope: "export default function Req({ senderid }) {",
+    ruleId: "react-hooks/exhaustive-deps",
+    lineNum: 14,
+    colNum: 5,
+  });
+
+  assert.match(prompt, /Rule: react-hooks\/exhaustive-deps/);
+  assert.match(prompt, /senderid/);
+});
+
+test("Task 8.6: Unknown useCallback dependencies warning extracted accurately", () => {
+  const callbackLog = [
+    "frontend/src/components/admin/AdminDashboard.jsx",
+    "  45:8  warning  React Hook useCallback has an unknown dependency: 'customHandler'  react-hooks/exhaustive-deps",
+  ].join("\n");
+
+  const diag = extractVerificationDiagnostics(callbackLog, 0);
+  assert.equal(diag.warnings.length, 1);
+  assert.equal(diag.warnings[0].ruleId, "react-hooks/exhaustive-deps");
+  assert.equal(diag.warnings[0].line, 45);
+  assert.match(diag.warnings[0].message, /unknown dependency: 'customHandler'/);
+});
+
+test("Task 8.7: Actual build failure isolated as build-transform error", () => {
+  const buildLog = [
+    "[vite:react-babel] frontend/src/components/user/req.jsx: Unexpected token, expected \",\" (15:2)",
+    "  13 |   return (",
+    "  14 |     <div>",
+    "> 15 |       <<Send />",
+    "     |        ^",
+  ].join("\n");
+
+  const diag = extractVerificationDiagnostics(buildLog, 1);
+  assert.equal(diag.passed, false);
+  assert.equal(diag.fatalErrors.length, 1);
+  assert.equal(diag.fatalErrors[0].ruleId, "build-transform");
+  assert.match(diag.fatalErrors[0].message, /Unexpected token/);
+});
+
+test("Task 8.8: Lint failure with successful build classified as LINT_FAILURE", async () => {
+  const mockTools = {
+    repo: "project",
+    runSandboxTest: async (cmd) => {
+      if (cmd.includes("lint")) {
+        return JSON.stringify({
+          exitCode: 1,
+          stdout: "frontend/src/App.jsx\n  10:5 error 'x' is not defined no-undef\n\n✖ 1 problem (1 error, 0 warnings)",
+          stderr: "",
+        });
+      }
+      if (cmd.includes("build")) {
+        return JSON.stringify({
+          exitCode: 0,
+          stdout: "vite v5.0.0 building for production... done in 0.8s",
+          stderr: "",
+        });
+      }
+      return JSON.stringify({ exitCode: 0, stdout: "", stderr: "" });
+    },
+  };
+
+  const pipeline = await runVerificationPipeline(
+    mockTools,
+    "npm run lint --prefix frontend && npm run build --prefix frontend",
+    { info: () => {}, warn: () => {}, error: () => {} }
+  );
+
+  assert.equal(pipeline.overallPassed, false);
+  assert.equal(pipeline.classification, "LINT_FAILURE");
+  assert.equal(pipeline.stages.length, 2);
+  assert.equal(pipeline.stages[0].stage, "lint");
+  assert.equal(pipeline.stages[0].passed, false);
+  assert.equal(pipeline.stages[1].stage, "build");
+  assert.equal(pipeline.stages[1].passed, true);
+  assert.match(pipeline.summary, /LINT_FAILURE/);
+});
+
+test("Task 8.9: Lint success with failed build classified as BUILD_FAILURE", async () => {
+  const mockTools = {
+    repo: "project",
+    runSandboxTest: async (cmd) => {
+      if (cmd.includes("lint")) {
+        return JSON.stringify({
+          exitCode: 0,
+          stdout: "frontend/src/App.jsx\n  10:5 warning React Hook useEffect has missing dep react-hooks/exhaustive-deps\n\n✖ 1 problem (0 errors, 1 warning)",
+          stderr: "",
+        });
+      }
+      if (cmd.includes("build")) {
+        return JSON.stringify({
+          exitCode: 1,
+          stdout: "",
+          stderr: "[vite] Error: Could not resolve './missing-module' from src/App.jsx",
+        });
+      }
+      return JSON.stringify({ exitCode: 0, stdout: "", stderr: "" });
+    },
+  };
+
+  const pipeline = await runVerificationPipeline(
+    mockTools,
+    "npm run lint --prefix frontend && npm run build --prefix frontend",
+    { info: () => {}, warn: () => {}, error: () => {} }
+  );
+
+  assert.equal(pipeline.overallPassed, false);
+  assert.equal(pipeline.classification, "BUILD_FAILURE");
+  assert.equal(pipeline.stages[0].passed, true);
+  assert.equal(pipeline.stages[1].passed, false);
+  assert.match(pipeline.summary, /BUILD_FAILURE/);
+});
+
+test("Task 8.10: Complete output exceeding 3000 chars preserves the fatal error at top", () => {
+  // Construct a large output with 1 error at top and 25 warnings below
+  const parts = [
+    "frontend/src/components/user/req.jsx",
+    "  15:7   error    'fatalDef' is not defined                       no-undef",
+    "",
+  ];
+  for (let i = 1; i <= 25; i++) {
+    parts.push(`frontend/src/components/file${i}.jsx`);
+    parts.push(`  ${i}:5   warning  React Hook useEffect missing dependency '${i}'  react-hooks/exhaustive-deps`);
+    parts.push("");
+  }
+  parts.push("✖ 26 problems (1 error, 25 warnings)");
+  const largeOutput = parts.join("\n");
+
+  assert.equal(largeOutput.length > 2500, true);
+
+  const diag = extractVerificationDiagnostics(largeOutput, 1);
+  assert.equal(diag.errorCount, 1);
+  assert.equal(diag.warningCount, 25);
+  assert.equal(diag.fatalErrors.length, 1);
+  assert.equal(diag.fatalErrors[0].filePath, "frontend/src/components/user/req.jsx");
+  assert.equal(diag.fatalErrors[0].line, 15);
+  assert.equal(diag.fatalErrors[0].message, "'fatalDef' is not defined");
+});
+
+test("Task 8.11: Existing warnings that remain after successful fix do not prevent PR", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "healops-warnings-remain-"));
+  try {
+    const sandbox = new Sandbox(tempDir);
+    const tools = new AgentTools({ workspaceDir: tempDir, sandbox });
+
+    const codeWithBug = 'import { useState } from "react";\nconst [data] = useState();\n';
+    await tools.applyFilePatch("req.jsx", codeWithBug);
+
+    // Mock sandbox runCommand to return 0 errors, 20 warnings
+    sandbox.runCommand = async () => ({
+      exitCode: 0,
+      stdout: "✖ 20 problems (0 errors, 20 warnings)",
+      stderr: "",
+      timedOut: false,
+      durationMs: 50,
+    });
+
+    const agent = new DiagnoserAgent({
+      tools,
+      apiKey: "mock-key",
+      model: "openai/gpt-oss-120b",
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+
+    agent.groq = {
+      chat: {
+        completions: {
+          create: async () => ({
+            choices: [
+              {
+                message: {
+                  content: `<<<<<<< SEARCH
+const [data] = useState();
+=======
+const [data, setData] = useState();
+console.log(data, setData);
+>>>>>>> REPLACE`,
+                },
+                finish_reason: "stop",
+              },
+            ],
+            usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+          }),
+        },
+      },
+    };
+
+    const result = await agent.runRemediation({
+      fatalErrorLine: "unused variable",
+      filePath: "req.jsx",
+      lineWindowSnippet: codeWithBug,
+      testCommand: "npm run lint",
+    });
+
+    // When ESLint has 0 errors and 20 warnings with exit code 0, verification must succeed!
+    assert.equal(result.success, true);
+    assert.equal(result.modifiedFiles.length, 1);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Task 8.12: New errors introduced by AI patch triggers rollback cleanly", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "healops-ai-new-err-"));
+  try {
+    const sandbox = new Sandbox(tempDir);
+    const tools = new AgentTools({ workspaceDir: tempDir, sandbox });
+
+    const originalCode = 'export const User = () => <div>Original Code</div>;\n';
+    await tools.applyFilePatch("User.jsx", originalCode);
+
+    // Mock Groq returning code that introduces an undefined variable
+    const mockGroq = {
+      chat: {
+        completions: {
+          create: async () => ({
+            choices: [
+              {
+                finish_reason: "stop",
+                message: {
+                  content: [
+                    '<<<<<<< SEARCH',
+                    '<div>Original Code</div>',
+                    '=======',
+                    '<div>{introducedUndefinedVariable}</div>',
+                    '>>>>>>> REPLACE',
+                  ].join("\n"),
+                },
+              },
+            ],
+            usage: { prompt_tokens: 100, completion_tokens: 30, total_tokens: 130 },
+          }),
+        },
+      },
+    };
+
+    const agent = new DiagnoserAgent({
+      tools,
+      apiKey: "mock-key",
+      model: "openai/gpt-oss-120b",
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    agent.groq = mockGroq;
+
+    // Simulate verification failing due to new error in User.jsx
+    sandbox.runCommand = async () => ({
+      exitCode: 1,
+      stdout: "User.jsx\n  1:35 error 'introducedUndefinedVariable' is not defined no-undef\n\n✖ 1 problem (1 error, 0 warnings)",
+      stderr: "",
+      timedOut: false,
+      durationMs: 50,
+    });
+
+    const result = await agent.runMultiFileRemediation({
+      culprits: [{ targetFile: "User.jsx", lineNum: 1, errors: ["syntax error"] }],
+      testCommand: "npm run lint",
+      delayMs: 0,
+    });
+
+    assert.equal(result.success, false);
+    // Verify file on disk rolled back to exact original content
+    const diskContent = await tools.getRepoFile("User.jsx");
+    assert.equal(diskContent, originalCode);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
