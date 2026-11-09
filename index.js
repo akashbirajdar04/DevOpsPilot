@@ -33,18 +33,20 @@ export default function healOpsApp(app, optionsOrBootTime) {
 
   app.on("workflow_run.completed", async (context) => {
     const { workflow_run, repository } = context.payload;
+    const repoId = repository.id || repository.name || "default";
     const runId = workflow_run.id;
+    const runAttempt = workflow_run.run_attempt || 1;
     const headBranch = workflow_run.head_branch;
     const conclusion = workflow_run.conclusion;
     const owner = repository.owner.login;
     const repo = repository.name;
 
     // -------------------------------------------------------------------------
-    // Guard 0: In-Flight Run Locking (Drop duplicate concurrent deliveries)
+    // Guard 0: In-Flight Run Locking & Idempotency Protection
     // -------------------------------------------------------------------------
-    if (!globalRunLock.acquire(runId)) {
+    if (!globalRunLock.acquire(repoId, runId, runAttempt)) {
       app.log.warn(
-        `[DUPLICATE RUN GUARD] Run #${runId} is currently being actively processed by another worker. Dropping duplicate webhook delivery.`
+        `[IDEMPOTENCY GUARD] Workflow Run #${runId} (Attempt ${runAttempt}, Repo: ${repoId}) is already processed or actively running. Dropping duplicate event.`
       );
       return;
     }
@@ -59,7 +61,7 @@ export default function healOpsApp(app, optionsOrBootTime) {
       app.log.info(
         `[STALE EVENT] Dropping replayed run from Smee.io (Run #${runId}, completed at ${runCompletedAt.toISOString()})`
       );
-      globalRunLock.release(runId);
+      globalRunLock.release(repoId, runId, runAttempt, false);
       return;
     }
 
@@ -68,7 +70,7 @@ export default function healOpsApp(app, optionsOrBootTime) {
     // -------------------------------------------------------------------------
     if (conclusion !== "failure") {
       app.log.info(`Skipping non-failure run conclusion: '${conclusion}'`);
-      globalRunLock.release(runId);
+      globalRunLock.release(repoId, runId, runAttempt, false);
       return;
     }
 
@@ -79,7 +81,7 @@ export default function healOpsApp(app, optionsOrBootTime) {
       app.log.info(
         `[ANTI-LOOP GUARD] Skipping run #${runId} on '${headBranch}' to prevent recursive remediation trigger.`
       );
-      globalRunLock.release(runId);
+      globalRunLock.release(repoId, runId, runAttempt, false);
       return;
     }
 
@@ -154,7 +156,7 @@ export default function healOpsApp(app, optionsOrBootTime) {
 
     if (!culprits || culprits.length === 0) {
       app.log.warn(`No culprit files detected via regex in Run #${runId} logs. Exiting cleanly.`);
-      globalRunLock.release(runId);
+      globalRunLock.release(repoId, runId, runAttempt, false);
       return;
     }
 
@@ -316,7 +318,7 @@ export default function healOpsApp(app, optionsOrBootTime) {
     } catch (err) {
       app.log.error(`Unhandled error during single-shot remediation: ${err.message}`);
     } finally {
-      globalRunLock.release(runId);
+      globalRunLock.release(repoId, runId, runAttempt, true);
       await sandbox.cleanup();
     }
   });

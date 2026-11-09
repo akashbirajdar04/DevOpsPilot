@@ -700,7 +700,31 @@ export class DiagnoserAgent {
         }
 
         const rawOutput = completion?.choices?.[0]?.message?.content || "";
+        const finishReason = completion?.choices?.[0]?.finish_reason || "unknown";
+        const promptTokens = completion?.usage?.prompt_tokens ?? -1;
+        const completionTokens = completion?.usage?.completion_tokens ?? -1;
+        const totalTokens = completion?.usage?.total_tokens ?? -1;
         const cleaned = cleanRawCodeOutput(rawOutput);
+
+        let detectedFormat = "UNKNOWN";
+        let blocksCount = 0;
+        if (cleaned.includes("<<<<<<< SEARCH")) {
+          detectedFormat = "SEARCH_REPLACE";
+          blocksCount = (cleaned.match(/<<<<<<< SEARCH/g) || []).length;
+        } else if (cleaned.includes("@@ -") || cleaned.includes("--- a/")) {
+          detectedFormat = "UNIFIED_DIFF";
+          blocksCount = (cleaned.match(/@@ -\d+/g) || []).length;
+        } else if (isFullFile) {
+          detectedFormat = "FULL_FILE";
+          blocksCount = 1;
+        }
+
+        const isTruncated = isTruncatedCode(rawOutput) || finishReason === "length";
+
+        // Requirement 3: Capture sanitized diagnostic information (no secrets or sensitive source code)
+        this.logger.info(
+          `[Groq Diagnostic] Target: '${targetFile}' | Format: ${detectedFormat} | Finish: ${finishReason} | Tokens: ${promptTokens} in / ${completionTokens} out / ${totalTokens} total | Truncated: ${isTruncated} | Blocks: ${blocksCount}`
+        );
 
         // Strong AI Output Validation
         const patchValidation = validatePatchOutput(cleaned, targetFile);
@@ -713,22 +737,14 @@ export class DiagnoserAgent {
         const searchReplaced = applySearchReplace(fullContent, cleaned);
         if (searchReplaced) {
           finalCode = searchReplaced;
-        } else if (cleaned.includes("<<<<<<< SEARCH") || cleaned.includes("=======")) {
-          const replaceBlocks = extractReplaceBlocks(cleaned);
-          if (replaceBlocks.length > 0 && targetSnippet && fullContent.includes(targetSnippet)) {
-            finalCode = fullContent.replace(targetSnippet, replaceBlocks[0]);
-          } else {
-            this.logger.warn(`Could not safely match diff markers for '${targetFile}'. Skipping.`);
-            continue;
-          }
         } else if (isFullFile && cleaned.length >= fullContent.length * 0.7) {
           finalCode = cleaned;
         } else {
-          this.logger.warn(`Could not safely determine surgical patch for '${targetFile}'. Skipping to prevent corruption.`);
+          this.logger.warn(`Could not safely match diff markers for '${targetFile}'. Skipping to prevent corruption.`);
           continue;
         }
 
-        // Strong AI Output Validation on Modified File
+        // Strong AI Output Validation on Modified File (AST Syntax Parsing)
         const fileValidation = validateModifiedFile(fullContent, finalCode, targetFile);
         if (!fileValidation.valid) {
           this.logger.warn(`[Validation Rejected] Modified '${targetFile}': ${fileValidation.reason}`);
@@ -791,8 +807,9 @@ export class DiagnoserAgent {
       };
     } else {
       const failureOutput = (testResult.stderr || testResult.stdout || "").trim();
-      this.logger.warn(
-        `❌ Multi-file remediation failed verification (exit code: ${testResult.exitCode}). Rolling back candidate edits...`
+      const fatalDiag = extractFatalErrorLine(failureOutput) || "Command exited with status " + testResult.exitCode;
+      this.logger.error(
+        `❌ Multi-file remediation failed verification (exit code: ${testResult.exitCode}).\nCommand: '${testCommand}'\nDiagnostic: ${fatalDiag}\nFull verification output:\n${failureOutput}`
       );
 
       // Atomic Rollback: Revert all files modified in Phase 2 so sandbox is not left corrupted

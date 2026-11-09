@@ -1,3 +1,5 @@
+import { parse } from "@babel/parser";
+
 /**
  * AI Output Validation Engine.
  * Verifies generated patches and code before applying to sandbox workspace.
@@ -26,35 +28,59 @@ export function hasUninitializedConst(code) {
 }
 
 /**
- * Verify balanced braces and parentheses.
+ * Validate JavaScript / JSX / TypeScript syntax using AST parser.
+ * Replaces naive bracket counting to accurately handle JSX tags, strings,
+ * comments, regex literals, template literals, and optional catch binding.
+ *
  * @param {string} code
- * @returns {boolean}
+ * @param {string} [filePath=""]
+ * @returns {{ valid: boolean, reason?: string }}
  */
-export function hasBalancedBrackets(code) {
-  if (!code) return true;
-  // Strip comments and string literals to prevent false positives in strings
-  const sanitized = code
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/\/\/.*$/gm, "")
-    .replace(/'(?:\\.|[^\\'])*'/g, "''")
-    .replace(/"(?:\\.|[^\\"])*"/g, '""')
-    .replace(/`(?:\\.|[^\\`])*`/g, "``");
+export function validateCodeSyntax(code, filePath = "") {
+  if (!code || typeof code !== "string") {
+    return { valid: false, reason: "Code is empty or invalid." };
+  }
 
-  const stack = [];
-  const pairs = { "}": "{", ")": "(", "]": "[" };
-
-  for (let i = 0; i < sanitized.length; i++) {
-    const char = sanitized[i];
-    if (char === "{" || char === "(" || char === "[") {
-      stack.push(char);
-    } else if (char === "}" || char === ")" || char === "]") {
-      if (stack.length === 0 || stack.pop() !== pairs[char]) {
-        return false;
-      }
+  // JSON files
+  if (filePath.endsWith(".json")) {
+    try {
+      JSON.parse(code);
+      return { valid: true };
+    } catch (jsonErr) {
+      return { valid: false, reason: `JSON syntax error: ${jsonErr.message}` };
     }
   }
 
-  return stack.length === 0;
+  // JS, JSX, TS, TSX files
+  if (/\.(?:jsx?|tsx?|mjs|cjs)$/i.test(filePath) || !filePath) {
+    try {
+      parse(code, {
+        sourceType: "module",
+        plugins: ["jsx", "typescript"],
+        errorRecovery: false,
+      });
+      return { valid: true };
+    } catch (parseErr) {
+      return {
+        valid: false,
+        reason: `Syntax error in '${filePath}': ${parseErr.message}`,
+      };
+    }
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Verify balanced braces and parentheses using AST parser with fallback.
+ * @param {string} code
+ * @param {string} [filePath=""]
+ * @returns {boolean}
+ */
+export function hasBalancedBrackets(code, filePath = "") {
+  if (!code) return true;
+  const result = validateCodeSyntax(code, filePath);
+  return result.valid;
 }
 
 /**
@@ -126,20 +152,10 @@ export function validateModifiedFile(originalContent, newContent, filePath = "")
     return { valid: false, reason: "Updated file contains uninitialized 'const' declaration." };
   }
 
-  // 5. JSON files must parse cleanly
-  if (filePath.endsWith(".json")) {
-    try {
-      JSON.parse(newContent);
-    } catch (jsonErr) {
-      return { valid: false, reason: `JSON syntax error: ${jsonErr.message}` };
-    }
-  }
-
-  // 6. JS/JSX/TS/TSX bracket balance check
-  if (/\.(?:jsx?|tsx?)$/i.test(filePath)) {
-    if (!hasBalancedBrackets(newContent)) {
-      return { valid: false, reason: "Unbalanced brackets or parentheses in modified code." };
-    }
+  // 5. Structural & syntax validation using AST parser (JS, JSX, TS, TSX, JSON)
+  const syntaxCheck = validateCodeSyntax(newContent, filePath);
+  if (!syntaxCheck.valid) {
+    return syntaxCheck;
   }
 
   return { valid: true };

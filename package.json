@@ -22,6 +22,7 @@
   "author": "HealOps",
   "license": "MIT",
   "dependencies": {
+    "@babel/parser": "^7.29.13",
     "adm-zip": "^0.5.16",
     "dotenv": "^16.4.7",
     "execa": "^9.5.2",

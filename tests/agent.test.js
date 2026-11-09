@@ -35,6 +35,7 @@ import { DeterministicFixer, renameUnusedIdentifier, autoFixUnusedVariable } fro
 import {
   validatePatchOutput,
   validateModifiedFile,
+  validateCodeSyntax,
   hasTruncationMarkers,
   hasUninitializedConst,
   hasBalancedBrackets,
@@ -1031,6 +1032,164 @@ test("Phase 7: applyUnifiedDiff applies standard unified diff hunks correctly", 
   assert.equal(applied.includes("let total = 10;"), true);
   assert.equal(applied.includes("let total = 0;"), false);
 });
+
+// =============================================================================
+// PARSER & IDEMPOTENCY REGRESSION TEST SUITE
+// =============================================================================
+
+test("Validator AST: Valid JSX and modern ECMAScript parses cleanly without false positives", () => {
+  const validJsx = [
+    'import React, { useState } from "react";',
+    'export const MessReq = ({ id }) => {',
+    '  const [status, setStatus] = useState("pending");',
+    '  return (',
+    '    <div className="container">',
+    '      <h2>Mess Request #{id}</h2>',
+    '      <p>Don\'t forget to verify details (before submitting)!</p>',
+    '      <button onClick={() => setStatus("accepted")}>Accept</button>',
+    '    </div>',
+    '  );',
+    '};',
+  ].join("\n");
+
+  const result = validateModifiedFile("const prev = 1;", validJsx, "frontend/src/components/user/mess_req.jsx");
+  assert.equal(result.valid, true);
+  assert.equal(hasBalancedBrackets(validJsx, "frontend/src/components/user/mess_req.jsx"), true);
+});
+
+test("Validator AST: Unbalanced JSX correctly caught with detailed syntax error", () => {
+  const brokenJsx = 'export function App() { return <div><span>Missing close div</span>; }';
+  const result = validateModifiedFile("const prev = 1;", brokenJsx, "App.jsx");
+  assert.equal(result.valid, false);
+  assert.match(result.reason, /Syntax error in 'App\.jsx'/);
+});
+
+test("Validator AST: Strings containing brackets and braces parse cleanly", () => {
+  const code = 'const template = "({[<>]}): special characters in string"; const count = 42;';
+  const result = validateModifiedFile("const prev = 1;", code, "test.js");
+  assert.equal(result.valid, true);
+});
+
+test("Validator AST: Comments containing unbalanced brackets parse cleanly", () => {
+  const code = [
+    '// TODO: fix this later (unmatched paren in comment',
+    '/* multiline comment { with unbalanced brace',
+    ' * another line',
+    ' */',
+    'export const ready = true;',
+  ].join("\n");
+  const result = validateModifiedFile("const prev = 1;", code, "test.js");
+  assert.equal(result.valid, true);
+});
+
+test("Validator AST: Nested template literals with expressions parse cleanly", () => {
+  const code = 'const msg = `User: ${user ? `${user.name} (${user.id})` : "(anonymous)"}`;';
+  const result = validateModifiedFile("const prev = 1;", code, "test.js");
+  assert.equal(result.valid, true);
+});
+
+test("Validator AST: Regular expression literals with braces and parentheses parse cleanly", () => {
+  const code = [
+    'const regexWithParen = /\\(/g;',
+    'const regexWithBrace = /\\{/g;',
+    'const regexWithQuantifier = /^[a-z]{2,8}$/i;',
+    'export function check(s) { return regexWithQuantifier.test(s); }',
+  ].join("\n");
+  const result = validateModifiedFile("const prev = 1;", code, "test.js");
+  assert.equal(result.valid, true);
+});
+
+test("Validator AST: Optional catch binding 'catch {}' parses cleanly", () => {
+  const code = [
+    'async function fetchData() {',
+    '  try {',
+    '    const res = await fetch("/api");',
+    '    return await res.json();',
+    '  } catch {',
+    '    console.error("fetch failed");',
+    '    return null;',
+    '  }',
+    '}',
+  ].join("\n");
+  const result = validateModifiedFile("const prev = 1;", code, "fetch.js");
+  assert.equal(result.valid, true);
+});
+
+test("Idempotency: Composite key (repoId, runId, runAttempt) prevents duplicate processing", () => {
+  const lock = new RunLock(60000, 3600000);
+  const repoId = 12345;
+  const runId = 42272228348;
+  const attempt = 1;
+
+  // First acquisition succeeds
+  assert.equal(lock.acquire(repoId, runId, attempt), true);
+
+  // In-flight concurrent duplicate delivery is rejected
+  assert.equal(lock.acquire(repoId, runId, attempt), false);
+
+  // Mark run as completed upon completion
+  lock.release(repoId, runId, attempt, true);
+
+  // After completion, redelivered duplicate webhook for the same attempt is rejected!
+  assert.equal(lock.acquire(repoId, runId, attempt), false);
+  assert.equal(lock.isCompleted(repoId, runId, attempt), true);
+
+  // A genuine new attempt (attempt 2) CAN be processed
+  assert.equal(lock.acquire(repoId, runId, 2), true);
+
+  // A different repo with the same runId CAN be processed
+  assert.equal(lock.acquire(99999, runId, attempt), true);
+});
+
+test("Atomic Rollback: Invalid candidate patch is rolled back without leaving dirty files", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "healops-atomic-rollback-"));
+  try {
+    const sandbox = new Sandbox(tempDir);
+    const tools = new AgentTools({ workspaceDir: tempDir, sandbox });
+    const cleanOriginal = 'export function Widget() { return <div>Original Clean Code</div>; }\n';
+    await tools.applyFilePatch("Widget.jsx", cleanOriginal);
+
+    const mockGroq = {
+      chat: {
+        completions: {
+          create: async () => ({
+            choices: [
+              {
+                finish_reason: "stop",
+                message: {
+                  content: '<<<<<<< SEARCH\n<div>Original Clean Code</div>\n=======\n<div>Broken Unclosed Code\n>>>>>>> REPLACE',
+                },
+              },
+            ],
+            usage: { prompt_tokens: 150, completion_tokens: 30, total_tokens: 180 },
+          }),
+        },
+      },
+    };
+
+    const agent = new DiagnoserAgent({
+      tools,
+      apiKey: "mock-key",
+      model: "openai/gpt-oss-120b",
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    agent.groq = mockGroq;
+
+    const result = await agent.runMultiFileRemediation({
+      culprits: [{ targetFile: "Widget.jsx", lineNum: 1, errors: ["syntax error"] }],
+      testCommand: 'node -e "process.exit(0)"',
+      delayMs: 0,
+    });
+
+    // Patch had unbalanced JSX, rejected by validator before touching sandbox or committing!
+    assert.equal(result.success, false);
+    const diskContent = await tools.getRepoFile("Widget.jsx");
+    assert.equal(diskContent, cleanOriginal);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 
 
 
