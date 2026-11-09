@@ -4,7 +4,12 @@
  */
 
 import Groq from "groq-sdk";
-import { extractFatalErrorLine, getLineWindow } from "../services/logParser.js";
+import {
+  extractFatalErrorLine,
+  getLineWindow,
+  extractCodeContext,
+  diagnoseLogErrors,
+} from "../services/logParser.js";
 import { sleep } from "../config.js";
 import { SRE_SYSTEM_PROMPT, buildRemediationUserPrompt } from "./prompts.js";
 import { DeterministicFixer } from "../services/deterministicFixer.js";
@@ -46,16 +51,48 @@ ${buildRemediationUserPrompt({ filePath, errorMessage: fatalErrorLine, lineWindo
 
 
 /**
- * Clean markdown code fences from raw LLM output if present.
+ * Clean markdown code fences and conversational filler from raw LLM output.
+ * Strips reasoning/think tags, extracts explicit SEARCH/REPLACE or diff blocks.
  * @param {string} rawContent
  * @returns {string}
  */
 export function cleanRawCodeOutput(rawContent) {
-  if (!rawContent) return "";
-  let cleaned = rawContent.trim();
-  cleaned = cleaned.replace(/^```[a-zA-Z0-9_-]*\r?\n/, "");
-  cleaned = cleaned.replace(/\r?\n```\s*$/, "");
-  return cleaned.trim();
+  if (!rawContent || typeof rawContent !== "string") return "";
+  let text = rawContent.trim();
+
+  // 1. Strip thinking tags: <think>...</think>
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+
+  // 2. If SEARCH/REPLACE blocks exist anywhere in the text, extract from first SEARCH to last REPLACE
+  const searchIdx = text.indexOf("<<<<<<< SEARCH");
+  const replaceIdx = text.lastIndexOf(">>>>>>> REPLACE");
+  if (searchIdx !== -1 && replaceIdx !== -1 && replaceIdx > searchIdx) {
+    return text.substring(searchIdx, replaceIdx + ">>>>>>> REPLACE".length).trim();
+  }
+
+  // 3. If unified diff blocks exist (--- and +++ and @@)
+  if (text.includes("@@") && (text.includes("---") || text.includes("+++"))) {
+    const fencedDiff = text.match(/```(?:diff|patch)?\s*\n([\s\S]*?)\n```/i);
+    if (fencedDiff) {
+      return fencedDiff[1].trim();
+    }
+    const atIdx = text.indexOf("@@ -");
+    if (atIdx !== -1) {
+      return text.substring(atIdx).replace(/\r?\n```\s*$/, "").trim();
+    }
+  }
+
+  // 4. If code is wrapped in markdown code fences, extract the fenced content
+  const fenceMatch = text.match(/^```[a-zA-Z0-9_-]*\r?\n([\s\S]*?)\r?\n```\s*$/);
+  if (fenceMatch) {
+    return fenceMatch[1].trim();
+  }
+
+  // Strip generic outer code fences
+  text = text.replace(/^```[a-zA-Z0-9_-]*\r?\n/, "");
+  text = text.replace(/\r?\n```\s*$/, "");
+
+  return text.trim();
 }
 
 /**
@@ -69,7 +106,77 @@ export function isTruncatedCode(code) {
 }
 
 /**
- * Surgically apply SEARCH/REPLACE blocks to file content.
+ * Surgically apply unified diff hunks (@@ -start,len +start,len @@) to file content.
+ * @param {string} fullContent
+ * @param {string} diffText
+ * @returns {string|null}
+ */
+export function applyUnifiedDiff(fullContent, diffText) {
+  if (!fullContent || !diffText) return null;
+  const isCrlf = fullContent.includes("\r\n");
+  const normalizedContent = fullContent.replace(/\r\n/g, "\n");
+  const normalizedDiff = diffText.replace(/\r\n/g, "\n");
+
+  const hunkRegex = /@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@[^\n]*\n([\s\S]*?)(?=(?:\n@@ -\d+|$))/g;
+  let updated = normalizedContent;
+  let matches = 0;
+  let m;
+
+  while ((m = hunkRegex.exec(normalizedDiff)) !== null) {
+    const hunkBody = m[3];
+    const hunkLines = hunkBody.split("\n");
+    const searchLines = [];
+    const replaceLines = [];
+
+    for (const line of hunkLines) {
+      if (line.startsWith("-")) {
+        searchLines.push(line.slice(1));
+      } else if (line.startsWith("+")) {
+        replaceLines.push(line.slice(1));
+      } else if (line.startsWith(" ")) {
+        searchLines.push(line.slice(1));
+        replaceLines.push(line.slice(1));
+      } else if (line === "") {
+        searchLines.push("");
+        replaceLines.push("");
+      }
+    }
+
+    if (searchLines.length === 0) continue;
+
+    const searchStr = searchLines.join("\n");
+    const replaceStr = replaceLines.join("\n");
+
+    if (updated.includes(searchStr)) {
+      updated = updated.replace(searchStr, replaceStr);
+      matches++;
+    } else {
+      // Fuzzy line match ignoring leading/trailing whitespace
+      const contentLines = updated.split("\n");
+      let foundIdx = -1;
+      for (let i = 0; i <= contentLines.length - searchLines.length; i++) {
+        const slice = contentLines.slice(i, i + searchLines.length).map((l) => l.trim());
+        if (slice.every((line, idx) => line === searchLines[idx].trim())) {
+          foundIdx = i;
+          break;
+        }
+      }
+      if (foundIdx !== -1) {
+        contentLines.splice(foundIdx, searchLines.length, replaceStr);
+        updated = contentLines.join("\n");
+        matches++;
+      }
+    }
+  }
+
+  if (matches > 0) {
+    return isCrlf ? updated.replace(/\n/g, "\r\n") : updated;
+  }
+  return null;
+}
+
+/**
+ * Surgically apply SEARCH/REPLACE blocks or unified diff to file content.
  * @param {string} fullContent
  * @param {string} patchText
  * @returns {string|null}
@@ -80,18 +187,24 @@ export function applySearchReplace(fullContent, patchText) {
   const normalizedContent = fullContent.replace(/\r\n/g, "\n");
   const normalizedPatch = patchText.replace(/\r\n/g, "\n");
 
-  const regex = /<<<<<<< SEARCH[^\n]*\n([\s\S]*?)\n=======[^\n]*\n([\s\S]*?)\n>>>>>>> REPLACE/g;
+  const regex = /<<<<<<< SEARCH[^\n]*\n([\s\S]*?)\n=======[^\n]*(?:\n([\s\S]*?))?\n>>>>>>> REPLACE/g;
   let updated = normalizedContent;
   let matches = 0;
   let m;
 
   while ((m = regex.exec(normalizedPatch)) !== null) {
     const search = m[1];
-    const replace = m[2];
-    const strippedSearch = search.replace(/^\s*\d+:\s*/gm, "");
-    const strippedReplace = replace.replace(/^\s*\d+:\s*/gm, "");
+    const replace = m[2] !== undefined ? m[2] : "";
+    const strippedSearch = search.replace(/^\s*\d+[:|]?\s*/gm, "");
+    const strippedReplace = replace.replace(/^\s*\d+[:|]?\s*/gm, "");
 
-    if (updated.includes(search)) {
+    if (replace === "" && updated.includes(search + "\n")) {
+      updated = updated.replace(search + "\n", "");
+      matches++;
+    } else if (strippedReplace === "" && updated.includes(strippedSearch + "\n")) {
+      updated = updated.replace(strippedSearch + "\n", "");
+      matches++;
+    } else if (updated.includes(search)) {
       updated = updated.replace(search, replace);
       matches++;
     } else if (updated.includes(strippedSearch)) {
@@ -107,8 +220,7 @@ export function applySearchReplace(fullContent, patchText) {
       // Fuzzy line match ignoring leading/trailing whitespace and line numbers
       const searchLines = (strippedSearch || search)
         .split("\n")
-        .map((l) => l.replace(/^\s*\d+:\s*/, "").trim())
-        .filter(Boolean);
+        .map((l) => l.replace(/^\s*\d+[:|]?\s*/, "").trim());
 
       if (searchLines.length > 0) {
         const contentLines = updated.split("\n");
@@ -124,7 +236,7 @@ export function applySearchReplace(fullContent, patchText) {
           const indent = contentLines[foundIdx].match(/^\s*/)?.[0] || "";
           const indentedReplace = strippedReplace
             .split("\n")
-            .map((l, idx) => (idx === 0 ? indent + l.trimStart() : l))
+            .map((l) => (l.trim() ? indent + l.trimStart() : ""))
             .join("\n");
           contentLines.splice(foundIdx, searchLines.length, indentedReplace);
           updated = contentLines.join("\n");
@@ -137,6 +249,15 @@ export function applySearchReplace(fullContent, patchText) {
   if (matches > 0) {
     return isCrlf ? updated.replace(/\n/g, "\r\n") : updated;
   }
+
+  // Fallback to unified diff parser if SEARCH/REPLACE produced 0 matches
+  if (normalizedPatch.includes("@@ -") || normalizedPatch.includes("--- a/")) {
+    const unifiedResult = applyUnifiedDiff(normalizedContent, normalizedPatch);
+    if (unifiedResult) {
+      return isCrlf ? unifiedResult.replace(/\n/g, "\r\n") : unifiedResult;
+    }
+  }
+
   return null;
 }
 
@@ -148,11 +269,11 @@ export function applySearchReplace(fullContent, patchText) {
 export function extractReplaceBlocks(patchText) {
   if (!patchText) return [];
   const normalized = patchText.replace(/\r\n/g, "\n");
-  const regex = /<<<<<<< SEARCH[^\n]*\n([\s\S]*?)\n=======[^\n]*\n([\s\S]*?)\n>>>>>>> REPLACE/g;
+  const regex = /<<<<<<< SEARCH[^\n]*\n([\s\S]*?)\n=======[^\n]*(?:\n([\s\S]*?))?\n>>>>>>> REPLACE/g;
   const blocks = [];
   let m;
   while ((m = regex.exec(normalized)) !== null) {
-    blocks.push(m[2]);
+    blocks.push(m[2] !== undefined ? m[2] : "");
   }
   return blocks;
 }
@@ -310,10 +431,13 @@ export class DiagnoserAgent {
       };
     }
 
-    // 1. Overwrite target file with returned code
+    // 1. Snapshot original file before overwriting
+    const originalContent = await this.tools.getRepoFile(targetFile);
+
+    // 2. Overwrite target file with returned code
     await this.tools.applyFilePatch(targetFile, fixedCode);
 
-    // 2. Run workspace test/build command once
+    // 3. Run workspace test/build command once
     this.logger.info(`Executing single-shot verification command: '${testCommand}'...`);
     const testResultJson = await this.tools.runSandboxTest(testCommand);
     const testResult = JSON.parse(testResultJson);
@@ -332,12 +456,16 @@ export class DiagnoserAgent {
     } else {
       const failureOutput = (testResult.stderr || testResult.stdout || "").trim();
       this.logger.warn(
-        `❌ Single-shot remediation was unsuccessful (exit code: ${testResult.exitCode}). Verification output:\n${failureOutput.slice(0, 1000)}`
+        `❌ Single-shot remediation was unsuccessful (exit code: ${testResult.exitCode}). Rolling back unverified changes...`
       );
+      if (originalContent && !originalContent.startsWith("Error:")) {
+        await this.tools.applyFilePatch(targetFile, originalContent);
+        this.logger.info(`↩️ Rolled back unverified fix on '${targetFile}'.`);
+      }
       return {
         success: false,
         rootCause: `Single-shot remediation failed verification in \`${targetFile}\`.`,
-        modifiedFiles: [targetFile],
+        modifiedFiles: [],
         fixedCode,
         testCommand,
         testOutput: testResult.stderr || testResult.stdout || `Failed with exit code ${testResult.exitCode}`,
@@ -430,18 +558,41 @@ export class DiagnoserAgent {
     // -------------------------------------------------------------------------
     // Phase 2: Token-Budgeted LLM Pipeline for Residual Files
     // -------------------------------------------------------------------------
-    // Only target files that genuinely failed deterministic fix or appear in compiler error output
-    const targetsToFix = culprits.filter((c) => {
-      if (residualFiles.includes(c.targetFile)) return true;
-      if (preCheckErrorOutput) {
-        const baseName = c.targetFile.split("/").pop();
-        if (preCheckErrorOutput.includes(c.targetFile) || preCheckErrorOutput.includes(baseName)) {
-          return true;
-        }
+    // Re-diagnose fresh errors on the actual post-deterministic sandbox output!
+    let targetsToFix = [];
+
+    if (preCheckErrorOutput) {
+      const freshDiag = diagnoseLogErrors(preCheckErrorOutput, this.tools.repo || "");
+      if (freshDiag.byFile && freshDiag.byFile.size > 0) {
+        this.logger.info(
+          `🔄 Re-diagnosed sandbox failure: ${freshDiag.errors.length} residual error(s) across ${freshDiag.byFile.size} file(s).`
+        );
+        targetsToFix = Array.from(freshDiag.byFile.entries()).map(([targetFile, errs]) => ({
+          targetFile,
+          lineNum: errs[0].lineNum || 1,
+          errors: errs.map((e) => e.message || e.raw),
+          structuredErrors: errs,
+        }));
       }
-      return false;
-    });
+    }
+
+    // Fallback if re-diagnosis produced no structured errors: use culprits filtered by residualFiles or error text
+    if (targetsToFix.length === 0) {
+      targetsToFix = culprits.filter((c) => {
+        if (residualFiles.includes(c.targetFile)) return true;
+        if (preCheckErrorOutput) {
+          const baseName = c.targetFile.split("/").pop();
+          if (preCheckErrorOutput.includes(c.targetFile) || preCheckErrorOutput.includes(baseName)) {
+            return true;
+          }
+        }
+        return false;
+      });
+    }
+
     const maxFiles = Math.min(targetsToFix.length, 15);
+    const snapshots = new Map();
+    const phase2PatchedFiles = [];
 
     if (maxFiles > 0) {
       this.logger.info(`🤖 Dispatching LLM remediation on ${maxFiles} residual file(s) (1 file/turn, max 3k in / 1k out)...`);
@@ -461,20 +612,30 @@ export class DiagnoserAgent {
           continue;
         }
 
+        // Snapshot original content before any candidate edits for atomic rollback
+        if (!snapshots.has(targetFile)) {
+          snapshots.set(targetFile, fullContent);
+        }
+
         const linesCount = fullContent.split("\n").length;
         // Never pass full files in multi-file remediation unless tiny (<= 25 lines)
         const isFullFile = linesCount <= 25;
-        let snippet = "";
+        let targetSnippet = "";
+        let enclosingScope = "";
+        let topImports = "";
 
         if (isFullFile) {
-          snippet = fullContent;
+          targetSnippet = fullContent;
         } else {
-          snippet = getLineWindow(fullContent, culprit.lineNum || 1, 15);
+          const ctx = extractCodeContext(fullContent, culprit.lineNum || 1, 8);
+          targetSnippet = ctx.targetSnippet;
+          enclosingScope = ctx.enclosingScope;
+          topImports = ctx.topImports;
         }
 
-        // Clamp snippet to stay strictly under input budget (~3000 tokens / 10,000 chars)
-        if (snippet.length > 8000) {
-          snippet = snippet.slice(0, 8000);
+        // Clamp snippet to stay strictly under input budget (~1500 tokens / 4,500 chars)
+        if (targetSnippet.length > 4500) {
+          targetSnippet = targetSnippet.slice(0, 4500);
         }
 
         this.logger.info(`[${i + 1}/${maxFiles}] [Groq (${this.model})] Patching '${targetFile}' (${culprit.errors?.length || 1} error(s))...`);
@@ -482,7 +643,9 @@ export class DiagnoserAgent {
         const prompt = buildRemediationUserPrompt({
           filePath: targetFile,
           errorMessage: errorText,
-          lineWindowSnippet: snippet,
+          lineWindowSnippet: targetSnippet,
+          enclosingScope,
+          topImports,
         });
 
         let completion;
@@ -511,7 +674,7 @@ export class DiagnoserAgent {
               groqErr.message?.toLowerCase().includes("timeout");
 
             if (isConnectionOrRateLimit && attempts < maxAttempts) {
-              const backoff = attempts * 3000;
+              const backoff = Math.min(attempts * 4000, 15000);
               this.logger.warn(
                 `[Groq] Rate-limit/timeout on '${targetFile}' (${groqErr.message}). Retrying in ${backoff / 1000}s (attempt ${attempts}/${maxAttempts})...`
               );
@@ -552,8 +715,8 @@ export class DiagnoserAgent {
           finalCode = searchReplaced;
         } else if (cleaned.includes("<<<<<<< SEARCH") || cleaned.includes("=======")) {
           const replaceBlocks = extractReplaceBlocks(cleaned);
-          if (replaceBlocks.length > 0 && snippet && fullContent.includes(snippet)) {
-            finalCode = fullContent.replace(snippet, replaceBlocks[0]);
+          if (replaceBlocks.length > 0 && targetSnippet && fullContent.includes(targetSnippet)) {
+            finalCode = fullContent.replace(targetSnippet, replaceBlocks[0]);
           } else {
             this.logger.warn(`Could not safely match diff markers for '${targetFile}'. Skipping.`);
             continue;
@@ -573,6 +736,9 @@ export class DiagnoserAgent {
         }
 
         await this.tools.applyFilePatch(targetFile, finalCode);
+        if (!phase2PatchedFiles.includes(targetFile)) {
+          phase2PatchedFiles.push(targetFile);
+        }
         if (!modifiedFiles.includes(targetFile)) {
           modifiedFiles.push(targetFile);
         }
@@ -626,12 +792,23 @@ export class DiagnoserAgent {
     } else {
       const failureOutput = (testResult.stderr || testResult.stdout || "").trim();
       this.logger.warn(
-        `❌ Multi-file remediation failed verification (exit code: ${testResult.exitCode}). Output:\n${failureOutput.slice(0, 1000)}`
+        `❌ Multi-file remediation failed verification (exit code: ${testResult.exitCode}). Rolling back candidate edits...`
       );
+
+      // Atomic Rollback: Revert all files modified in Phase 2 so sandbox is not left corrupted
+      for (const [revertPath, originalCode] of snapshots.entries()) {
+        try {
+          await this.tools.applyFilePatch(revertPath, originalCode);
+          this.logger.info(`↩️ Rolled back candidate changes to '${revertPath}'.`);
+        } catch (rbErr) {
+          this.logger.error(`Failed to rollback '${revertPath}': ${rbErr.message}`);
+        }
+      }
+
       return {
         success: false,
-        rootCause: `Remediation failed verification across ${modifiedFiles.length} file(s).`,
-        modifiedFiles,
+        rootCause: `Remediation failed verification across ${modifiedFiles.length} file(s). Rolled back candidate edits.`,
+        modifiedFiles: repairedFiles,
         testCommand,
         testOutput: failureOutput,
         iterations: 1,

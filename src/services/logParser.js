@@ -274,6 +274,71 @@ export function getLineWindow(fileContent, lineNum, windowSize = 15) {
 }
 
 /**
+ * Extract targeted unnumbered context around lineNum along with enclosing scope and top-level imports.
+ * Designed to provide exact target lines for character-exact SEARCH matching without line number pollution.
+ *
+ * @param {string} fileContent
+ * @param {number} lineNum
+ * @param {number} [windowSize=8]
+ * @returns {{ targetSnippet: string, enclosingScope: string, topImports: string }}
+ */
+export function extractCodeContext(fileContent, lineNum, windowSize = 8) {
+  if (!fileContent || typeof fileContent !== "string") {
+    return { targetSnippet: "", enclosingScope: "", topImports: "" };
+  }
+
+  const lines = fileContent.split("\n");
+  const num = parseInt(lineNum, 10);
+  const target = !num || isNaN(num) || num < 1 ? 1 : Math.min(num, lines.length);
+
+  // 1. Target snippet around error (no line numbers!)
+  const start = Math.max(0, target - 1 - windowSize);
+  const end = Math.min(lines.length, target + windowSize);
+  const targetSnippet = lines.slice(start, end).join("\n");
+
+  // 2. Extract top imports (first 25 lines)
+  const importLines = [];
+  for (let i = 0; i < Math.min(25, lines.length); i++) {
+    const l = lines[i];
+    if (/^\s*(import\s|const\s+.*\s*=\s*require\()/.test(l)) {
+      importLines.push(l);
+    }
+  }
+  const topImports = importLines.join("\n");
+
+  // 3. Find enclosing component or function declaration before target line
+  let enclosingScope = "";
+  // First look for top-level component or outer function declaration
+  for (let i = target - 1; i >= 0; i--) {
+    const l = lines[i];
+    if (
+      /^\s{0,2}(?:export\s+(?:default\s+)?)?(?:(?:async\s+)?function\s+[A-Za-z0-9_$]+|class\s+[A-Za-z0-9_$]+|(?:const|let|var)\s+[A-Z][A-Za-z0-9_$]*\s*=)/.test(
+        l
+      )
+    ) {
+      enclosingScope = l.trim();
+      break;
+    }
+  }
+  // Fallback: look for any enclosing function or arrow function declaration
+  if (!enclosingScope) {
+    for (let i = target - 1; i >= 0; i--) {
+      const l = lines[i];
+      if (
+        /^\s*(?:export\s+(?:default\s+)?)?(?:(?:async\s+)?function(?:\s+[A-Za-z0-9_$]+)?|class\s+[A-Za-z0-9_$]+|(?:const|let|var)\s+[A-Za-z0-9_$]+\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z0-9_$]+)\s*=>)/.test(
+          l
+        )
+      ) {
+        enclosingScope = l.trim();
+        break;
+      }
+    }
+  }
+
+  return { targetSnippet, enclosingScope, topImports };
+}
+
+/**
  * Structured error diagnostic result representation.
  * @typedef {object} DiagnosticError
  * @property {string} filePath - Repo relative file path

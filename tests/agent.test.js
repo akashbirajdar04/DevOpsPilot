@@ -15,6 +15,7 @@ import {
   extractAllCulprits,
   extractFatalErrorLine,
   getLineWindow,
+  extractCodeContext,
   diagnoseLogErrors,
 } from "../src/services/logParser.js";
 import { Sandbox } from "../src/services/sandbox.js";
@@ -24,6 +25,7 @@ import {
   buildSingleShotPrompt,
   cleanRawCodeOutput,
   applySearchReplace,
+  applyUnifiedDiff,
   isTruncatedCode,
   SRE_SYSTEM_PROMPT,
   buildRemediationUserPrompt,
@@ -676,5 +678,359 @@ test("AgentTools: getRepoFile returns full content without 1800-char truncation"
     await fs.rm(tempDir, { recursive: true, force: true });
   }
 });
+
+// =============================================================================
+// PHASE 7: AUTOMATED REGRESSION SUITE (14 Targeted Regression Cases)
+// =============================================================================
+
+test("Phase 7 [1/14]: Unused JS var repaired surgically without regressions", () => {
+  const code = 'import React from "react";\nconst unusedToken = 123;\nexport function Button() { return <button>Click</button>; }\n';
+  const patch = "<<<<<<< SEARCH\nconst unusedToken = 123;\n=======\n>>>>>>> REPLACE";
+  const result = applySearchReplace(code, patch);
+  assert.equal(result.includes("unusedToken"), false);
+  assert.equal(result.includes("export function Button"), true);
+});
+
+test("Phase 7 [2/14]: Undefined React Hook import added cleanly", () => {
+  const code = 'import React from "react";\nexport function Counter() {\n  const [count, setCount] = useState(0);\n  return <div>{count}</div>;\n}\n';
+  const patch = '<<<<<<< SEARCH\nimport React from "react";\n=======\nimport React, { useState } from "react";\n>>>>>>> REPLACE';
+  const result = applySearchReplace(code, patch);
+  assert.equal(result.includes('import React, { useState } from "react";'), true);
+  assert.equal(result.includes("return <div>{count}</div>;"), true);
+});
+
+test("Phase 7 [3/14]: Missing React Hook dependency added to array", () => {
+  const code = 'useEffect(() => {\n  console.log(userId);\n}, []);';
+  const patch = '<<<<<<< SEARCH\n}, []);\n=======\n}, [userId]);\n>>>>>>> REPLACE';
+  const result = applySearchReplace(code, patch);
+  assert.equal(result.includes('}, [userId]);'), true);
+});
+
+test("Phase 7 [4/14]: Valid minimal patch with character-exact SEARCH/REPLACE", () => {
+  const code = 'const status = "pending";\n';
+  const patch = '<<<<<<< SEARCH\nconst status = "pending";\n=======\nconst status = "active";\n>>>>>>> REPLACE';
+  const result = applySearchReplace(code, patch);
+  assert.equal(result, 'const status = "active";\n');
+});
+
+test("Phase 7 [5/14]: Empty AI response is cleanly rejected and disk remains untouched", () => {
+  assert.equal(validatePatchOutput("").valid, false);
+  assert.equal(validatePatchOutput("   \n\t  ").valid, false);
+  assert.equal(validatePatchOutput("").reason.includes("Empty patch"), true);
+});
+
+test("Phase 7 [6/14]: Malformed unified diff rejected without corrupting file", () => {
+  const code = 'const a = 1;\nconst b = 2;\n';
+  const malformedDiff = '@@ -invalid hunk header @@\n-broken line\n+fixed line';
+  const result = applyUnifiedDiff(code, malformedDiff);
+  assert.equal(result, null);
+});
+
+test("Phase 7 [7/14]: Patch that cannot match source fails safely and returns null", () => {
+  const code = 'const alpha = 100;\n';
+  const nonMatchingPatch = '<<<<<<< SEARCH\nconst nonexistent = 999;\n=======\nconst nonexistent = 1000;\n>>>>>>> REPLACE';
+  const result = applySearchReplace(code, nonMatchingPatch);
+  assert.equal(result, null);
+});
+
+test("Phase 7 [8/14]: Truncated JSX output rejected by validator", () => {
+  const truncated1 = 'function Card() {\n  return (\n    <div>\n      // [Remaining lines omitted for brevity]\n    </div>\n  );\n}';
+  assert.equal(validatePatchOutput(truncated1).valid, false);
+  assert.equal(hasTruncationMarkers(truncated1), true);
+
+  const unbalancedJsx = 'function Card() { return (<div><span>Hello</div>; }';
+  assert.equal(validateModifiedFile('function Card() {}', unbalancedJsx, 'Card.jsx').valid, false);
+});
+
+test("Phase 7 [9/14]: Valid no-change response preserves original file exactly", () => {
+  const code = 'const PORT = 3000;\n';
+  const noChangePatch = '<<<<<<< SEARCH\nconst PORT = 3000;\n=======\nconst PORT = 3000;\n>>>>>>> REPLACE';
+  const result = applySearchReplace(code, noChangePatch);
+  assert.equal(result, code);
+});
+
+test("Phase 7 [10/14]: Groq HTTP 429 response triggers backoff and successful retry", async () => {
+  let attempts = 0;
+  const mockGroq = {
+    chat: {
+      completions: {
+        create: async () => {
+          attempts++;
+          if (attempts === 1) {
+            const err = new Error("Rate limit reached: 8000 TPM exceeded");
+            err.status = 429;
+            throw err;
+          }
+          return {
+            choices: [
+              {
+                message: {
+                  content: '<<<<<<< SEARCH\nconst x = 1;\n=======\nconst x = 2;\n>>>>>>> REPLACE',
+                },
+              },
+            ],
+          };
+        },
+      },
+    },
+  };
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "healops-429-test-"));
+  try {
+    const sandbox = new Sandbox(tempDir);
+    const tools = new AgentTools({ workspaceDir: tempDir, sandbox });
+    await tools.applyFilePatch("test.js", "const x = 1;\n");
+
+    const agent = new DiagnoserAgent({
+      tools,
+      apiKey: "mock-key",
+      model: "openai/gpt-oss-120b",
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    agent.groq = mockGroq;
+
+    const result = await agent.runMultiFileRemediation({
+      culprits: [{ targetFile: "test.js", lineNum: 1, errors: ["error in line 1"] }],
+      testCommand: 'node -e "process.exit(0)"',
+      delayMs: 10,
+    });
+
+    assert.equal(attempts, 2);
+    assert.equal(result.success, true);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Phase 7 [11/14]: Duplicate workflow events blocked by RunLock and replay filter", () => {
+  const lock = new RunLock();
+  assert.equal(lock.acquire(1001), true);
+  assert.equal(lock.acquire(1001), false);
+  lock.release(1001);
+  assert.equal(lock.acquire(1001), true);
+});
+
+test("Phase 7 [12/14]: Verification failure triggers atomic rollback to clean snapshot", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "healops-rollback-test-"));
+  try {
+    const sandbox = new Sandbox(tempDir);
+    const tools = new AgentTools({ workspaceDir: tempDir, sandbox });
+    const initialCode = "const originalState = true;\n";
+    await tools.applyFilePatch("state.js", initialCode);
+
+    const mockGroq = {
+      chat: {
+        completions: {
+          create: async () => ({
+            choices: [
+              {
+                message: {
+                  content: '<<<<<<< SEARCH\nconst originalState = true;\n=======\nconst brokenCandidate = false;\n>>>>>>> REPLACE',
+                },
+              },
+            ],
+          }),
+        },
+      },
+    };
+
+    const agent = new DiagnoserAgent({
+      tools,
+      apiKey: "mock-key",
+      model: "openai/gpt-oss-120b",
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    agent.groq = mockGroq;
+
+    // testCommand fails with exit code 1
+    const result = await agent.runMultiFileRemediation({
+      culprits: [{ targetFile: "state.js", lineNum: 1, errors: ["syntax error"] }],
+      testCommand: 'node -e "process.exit(1)"',
+      delayMs: 0,
+    });
+
+    assert.equal(result.success, false);
+    // Verified atomic rollback: file on disk has been reverted to initialCode!
+    const restoredCode = await tools.getRepoFile("state.js");
+    assert.equal(restoredCode, initialCode);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Phase 7 [13/14]: Previously passing files remain 100% untouched byte-for-byte", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "healops-untouched-test-"));
+  try {
+    const sandbox = new Sandbox(tempDir);
+    const tools = new AgentTools({ workspaceDir: tempDir, sandbox });
+    const brokenCode = "const bad = 1;\n";
+    const passingCode = "export const PI = 3.14159;\nexport function getPi() { return PI; }\n";
+
+    await tools.applyFilePatch("broken.js", brokenCode);
+    await tools.applyFilePatch("passing.js", passingCode);
+
+    const mockGroq = {
+      chat: {
+        completions: {
+          create: async () => ({
+            choices: [
+              {
+                message: {
+                  content: '<<<<<<< SEARCH\nconst bad = 1;\n=======\nconst bad = 2;\n>>>>>>> REPLACE',
+                },
+              },
+            ],
+          }),
+        },
+      },
+    };
+
+    const agent = new DiagnoserAgent({
+      tools,
+      apiKey: "mock-key",
+      model: "openai/gpt-oss-120b",
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    agent.groq = mockGroq;
+
+    const result = await agent.runMultiFileRemediation({
+      culprits: [{ targetFile: "broken.js", lineNum: 1, errors: ["err"] }],
+      testCommand: 'node -e "process.exit(0)"',
+      delayMs: 0,
+    });
+
+    assert.equal(result.success, true);
+    // passing.js must remain 100% untouched
+    const fetchedPassing = await tools.getRepoFile("passing.js");
+    assert.equal(fetchedPassing, passingCode);
+    assert.equal(result.modifiedFiles.includes("passing.js"), false);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Phase 7 [14/14]: Unknown diagnostic category routed safely to LLM", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "healops-unknown-cat-test-"));
+  try {
+    const sandbox = new Sandbox(tempDir);
+    const tools = new AgentTools({ workspaceDir: tempDir, sandbox });
+    const brokenCode = "export function parse(input) { return input.substring(0, 5); }\n";
+    await tools.applyFilePatch("parser.js", brokenCode);
+
+    let llmCalled = false;
+    const mockGroq = {
+      chat: {
+        completions: {
+          create: async () => {
+            llmCalled = true;
+            return {
+              choices: [
+                {
+                  message: {
+                    content: '<<<<<<< SEARCH\nexport function parse(input) { return input.substring(0, 5); }\n=======\nexport function parse(input) { return (input || "").substring(0, 5); }\n>>>>>>> REPLACE',
+                  },
+                },
+              ],
+            };
+          },
+        },
+      },
+    };
+
+    const agent = new DiagnoserAgent({
+      tools,
+      apiKey: "mock-key",
+      model: "openai/gpt-oss-120b",
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    agent.groq = mockGroq;
+
+    const result = await agent.runMultiFileRemediation({
+      culprits: [
+        {
+          targetFile: "parser.js",
+          lineNum: 1,
+          errors: ["TS2532: Object is possibly 'undefined'."],
+          structuredErrors: [
+            {
+              filePath: "parser.js",
+              lineNum: 1,
+              category: "compiler",
+              rule: "TS2532",
+              message: "Object is possibly 'undefined'.",
+              raw: "TS2532: Object is possibly 'undefined'.",
+            },
+          ],
+        },
+      ],
+      testCommand: 'node -e "process.exit(0)"',
+      delayMs: 0,
+    });
+
+    assert.equal(llmCalled, true);
+    assert.equal(result.success, true);
+    const patchedCode = await tools.getRepoFile("parser.js");
+    assert.equal(patchedCode.includes('(input || "").substring(0, 5)'), true);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Phase 7: extractCodeContext extracts unnumbered target, enclosing scope, and top imports", () => {
+  const sampleFile = [
+    'import React, { useState } from "react";',
+    'import api from "../lib/api";',
+    '',
+    'export default function UserProfile() {',
+    '  const [user, setUser] = useState(null);',
+    '  const [error, setError] = useState(null);',
+    '',
+    '  const fetchUser = async () => {',
+    '    try {',
+    '      const res = await api.get("/user");',
+    '      setUser(res.data);',
+    '    } catch (e) {',
+    '      setError(e.message);',
+    '    }',
+    '  };',
+    '',
+    '  return <div>{user?.name}</div>;',
+    '}',
+  ].join("\n");
+
+  const ctx = extractCodeContext(sampleFile, 12, 3);
+  assert.equal(ctx.topImports.includes('import React, { useState } from "react";'), true);
+  assert.equal(ctx.enclosingScope, "export default function UserProfile() {");
+  assert.equal(ctx.targetSnippet.includes("catch (e) {"), true);
+  assert.equal(ctx.targetSnippet.includes("12:"), false); // No prepended line numbers!
+});
+
+test("Phase 7: applyUnifiedDiff applies standard unified diff hunks correctly", () => {
+  const sourceCode = [
+    'function calculateTotal(items) {',
+    '  let total = 0;',
+    '  for (const item of items) {',
+    '    total += item.price;',
+    '  }',
+    '  return total;',
+    '}',
+  ].join("\n");
+
+  const unifiedDiff = [
+    '--- a/calc.js',
+    '+++ b/calc.js',
+    '@@ -2,3 +2,3 @@',
+    ' function calculateTotal(items) {',
+    '-  let total = 0;',
+    '+  let total = 10;',
+    '   for (const item of items) {',
+  ].join("\n");
+
+  const applied = applyUnifiedDiff(sourceCode, unifiedDiff);
+  assert.notEqual(applied, null);
+  assert.equal(applied.includes("let total = 10;"), true);
+  assert.equal(applied.includes("let total = 0;"), false);
+});
+
 
 

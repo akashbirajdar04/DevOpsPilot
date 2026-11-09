@@ -7,25 +7,27 @@ Inspect the broken code snippet and return a minimal SEARCH/REPLACE diff resolvi
 
 ### REMEDIATION TAXONOMY & RULES
 1. ESLint / Linter Failures:
-   - 'no-unused-vars': For unused catch errors, rewrite to optional catch binding 'catch {}'. For unused imports, remove the unused import symbol. For unused parameters, drop parameter (e.g. '() =>').
+   - 'no-unused-vars': For unused catch parameters, ALWAYS rewrite to optional catch binding 'catch {}'. NEVER rename the parameter to '_e' or '_err'. For unused imports, remove the unused import specifier; if no specifiers remain, remove the entire import statement. For unused parameters, drop parameter (e.g. '() =>'). Never rename identifiers in module import paths.
    - 'no-undef': Add required import at top of file or define in scope. If using React hooks, ensure 'import React, { useState, useEffect } from "react";' is present.
-   - 'react-hooks/rules-of-hooks': React hooks must ALWAYS be called inside a React function component, NEVER at top-level module scope.
+   - 'react-hooks/rules-of-hooks': React hooks must ALWAYS be called inside a React function component or custom hook, NEVER at top-level module scope.
    - 'prefer-const': Change 'let' to 'const' if never reassigned.
-   - 'react-hooks/exhaustive-deps': Add missing dependency or memoize callback.
+   - 'react-hooks/exhaustive-deps': Add missing dependency to hook dependency array or memoize callback.
 2. Syntax & Modern ECMAScript / TypeScript:
-   - Optional Catch Binding: Rewrite 'catch (err)' to 'catch {}' or '_err'.
+   - Optional Catch Binding: Rewrite 'catch (e)' or 'catch (err)' to ECMAScript standard 'catch {}'.
    - Type Mismatches (TS2322, TS2345): Update type annotations, add null/undefined guards ('?.').
 3. Module & Dependency Failures:
-   - Fix relative import paths ('../' vs './') or updated export names.
+   - Fix relative import paths ('../' vs './') or updated export names. Preserve exact package names.
 4. Test Assertions:
    - Fix code to meet test expectation; never delete test assertions.
 
-### OUTPUT FORMAT SPECIFICATION (STRICT)
-- Output ONLY a surgical SEARCH/REPLACE block with zero markdown prose or greeting.
-- SEARCH block must match target lines character-for-character including indentation (2-8 lines).
-- NEVER omit code or output placeholder comments like '// ... rest of code' or '// [Remaining lines omitted]'. Provide complete, syntactically valid code blocks.
+### ZERO TRUNCATION & AST INVARIANTS (CRITICAL)
+- NEVER omit code or output placeholder comments like '// ... rest of code' or '// [Remaining lines omitted]'.
+- Provide complete, syntactically valid code blocks.
+- Never output Git merge conflict markers (<<<<<<< HEAD, =======, >>>>>>> origin).
+- Output ONLY the SEARCH/REPLACE block. Zero markdown conversational prose, zero thinking tags, zero explanations.
 
-Required Structure:
+### OUTPUT FORMAT SPECIFICATION (STRICT)
+You must output ONLY one or more SEARCH/REPLACE blocks in this exact format:
 <<<<<<< SEARCH
 [exact lines to replace from target snippet]
 =======
@@ -33,17 +35,33 @@ Required Structure:
 >>>>>>> REPLACE
 `;
 
-export function buildRemediationUserPrompt({ filePath, errorMessage, lineWindowSnippet }) {
+export function buildRemediationUserPrompt({
+  filePath,
+  errorMessage,
+  lineWindowSnippet,
+  enclosingScope = "",
+  topImports = "",
+}) {
+  let contextBlock = "";
+  if (topImports) {
+    contextBlock += `Top Imports:\n${topImports}\n\n`;
+  }
+  if (enclosingScope) {
+    contextBlock += `Enclosing Scope:\n${enclosingScope}\n\n`;
+  }
+
   return `Target File: ${filePath}
-Failure Reason:
+Failure Diagnostics:
 ${errorMessage}
 
-Code Context (centered on error line):
+${contextBlock}Code Context (centered on error line):
 ---
 ${lineWindowSnippet}
 ---
 
-Provide the surgical SEARCH/REPLACE block to fix this issue immediately.`;
+TASK:
+Provide the surgical SEARCH/REPLACE block to fix this issue immediately.
+Do NOT repeat line numbers in the SEARCH block. Match the target code exactly.`;
 }
 
 

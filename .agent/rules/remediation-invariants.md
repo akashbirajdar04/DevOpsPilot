@@ -23,3 +23,4 @@ description: Invariants for fixing CI/CD lint, build, and syntax errors
      npm run lint --prefix frontend && npm run build --prefix frontend
      ```
    - If the verification exit code is non-zero, do not commit. Re-inspect errors and adjust.
+
