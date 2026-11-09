@@ -562,3 +562,181 @@ export function parseLog(rawLog, maxLines = 30) {
     detectedTargets: culprit ? [{ file: culprit.targetFile, line: culprit.lineNum }] : [],
   };
 }
+
+/**
+ * Extract structured verification diagnostics from failed build/lint/test commands.
+ * Distinguishes between fatal errors (severity: error / exit code causes) and benign warnings
+ * (e.g., React hook warnings that do not fail the build unless --max-warnings=0).
+ *
+ * @param {string} rawOutput - stdout and stderr of the verification command
+ * @param {number} [exitCode=1] - Process exit code
+ * @param {string} [repoName=""] - Optional repository name for relative path normalization
+ * @returns {{ exitCode: number, fatalErrors: Array<object>, warnings: Array<object>, errorCount: number, warningCount: number, summary: string }}
+ */
+export function extractVerificationDiagnostics(rawOutput, exitCode = 1, repoName = "") {
+  if (!rawOutput || typeof rawOutput !== "string") {
+    return {
+      exitCode,
+      fatalErrors: [],
+      warnings: [],
+      errorCount: 0,
+      warningCount: 0,
+      summary: `Verification failed with exit code ${exitCode} (no output).`,
+    };
+  }
+
+  const clean = stripAnsi(rawOutput).replace(/\r\n/g, "\n");
+  const lines = clean.split("\n");
+
+  const fatalErrors = [];
+  const warnings = [];
+  let summaryErrorCount = 0;
+  let summaryWarningCount = 0;
+
+  // Check for ESLint summary line: "✖ 21 problems (1 error, 20 warnings)"
+  const summaryMatch = clean.match(/(\d+)\s+problems?\s*\(\s*(\d+)\s+errors?,\s*(\d+)\s+warnings?\s*\)/i);
+  if (summaryMatch) {
+    summaryErrorCount = parseInt(summaryMatch[2], 10);
+    summaryWarningCount = parseInt(summaryMatch[3], 10);
+  }
+
+  let currentFile = "";
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    // Ignore npm / gha notices
+    if (/^(?:##\[|===|\s*>|\s*npm\s+(?:notice|warn)|Process completed with exit code)/i.test(line)) {
+      continue;
+    }
+
+    // 1. Check for file header: /path/to/file.jsx or relative path
+    const fileHeaderMatch = line.match(
+      /^(?:(?:Error|Warning|##\[\w+\]):\s*)?((?:(?:\/|[a-zA-Z]:\/)[a-zA-Z0-9_\-./]+|(?:[a-zA-Z0-9_\-.]+\/)+[a-zA-Z0-9_\-.]+)\.(?:jsx?|tsx?|json|py|vue|svelte|css|html))$/i
+    );
+    if (fileHeaderMatch && !line.includes(" error ") && !line.includes(" warning ")) {
+      currentFile = cleanRepoFilePath(fileHeaderMatch[1], repoName);
+      continue;
+    }
+
+    // 2. ESLint table row: "  15:7  error  'handleSubmit' is not defined  no-undef"
+    const eslintMatch = line.match(
+      /^(?:(?:Error|Warning|##\[\w+\]):\s*)?(\d+):(\d+)\s+(error|warning)\s+(.*?)(?:\s{2,}([a-zA-Z0-9_\-/@]+))?$/i
+    );
+    if (eslintMatch) {
+      const lineNum = parseInt(eslintMatch[1], 10);
+      const colNum = parseInt(eslintMatch[2], 10);
+      const severity = eslintMatch[3].toLowerCase();
+      const message = eslintMatch[4].trim();
+      const ruleId = (eslintMatch[5] || "").trim();
+
+      const item = {
+        filePath: currentFile || "unknown",
+        line: lineNum,
+        column: colNum,
+        severity,
+        ruleId,
+        message,
+        raw: line,
+      };
+
+      if (severity === "error") {
+        fatalErrors.push(item);
+      } else {
+        warnings.push(item);
+      }
+      continue;
+    }
+
+    // 3. Vite / ESBuild / Webpack / Babel error:
+    // [vite:react-babel] /path/to/file.jsx: Unexpected token (15:2)
+    const viteMatch = line.match(/^\[?(?:vite|esbuild|webpack|babel|rollup)[^\]]*\]?\s*(.*?):(\d+):(\d+):\s*(.*)$/i);
+    if (viteMatch) {
+      const filePath = cleanRepoFilePath(viteMatch[1].trim(), repoName);
+      const lineNum = parseInt(viteMatch[2], 10);
+      const colNum = parseInt(viteMatch[3], 10);
+      const message = viteMatch[4].trim();
+
+      fatalErrors.push({
+        filePath,
+        line: lineNum,
+        column: colNum,
+        severity: "error",
+        ruleId: "build-transform",
+        message,
+        raw: line,
+      });
+      continue;
+    }
+
+    // 4. TypeScript compiler: src/file.ts:15:3 - error TS2322: ...
+    const tsMatch = line.match(/^(.*?):(\d+):(\d+)\s*-\s*error\s*(TS\d+):\s*(.*)$/i);
+    if (tsMatch) {
+      const filePath = cleanRepoFilePath(tsMatch[1].trim(), repoName);
+      const lineNum = parseInt(tsMatch[2], 10);
+      const colNum = parseInt(tsMatch[3], 10);
+      const ruleId = tsMatch[4];
+      const message = tsMatch[5].trim();
+
+      fatalErrors.push({
+        filePath,
+        line: lineNum,
+        column: colNum,
+        severity: "error",
+        ruleId,
+        message,
+        raw: line,
+      });
+      continue;
+    }
+
+    // 5. Standalone fatal error lines (SyntaxError, TypeError, ReferenceError)
+    if (/\b(?:SyntaxError|TypeError|ReferenceError):\s*(.*)/i.test(line)) {
+      const synMatch = line.match(/\b(SyntaxError|TypeError|ReferenceError):\s*(.*)/i);
+      fatalErrors.push({
+        filePath: currentFile || "unknown",
+        line: 0,
+        column: 0,
+        severity: "error",
+        ruleId: synMatch[1],
+        message: synMatch[2].trim(),
+        raw: line,
+      });
+      continue;
+    }
+  }
+
+  const finalErrorCount = Math.max(fatalErrors.length, summaryErrorCount);
+  const finalWarningCount = Math.max(warnings.length, summaryWarningCount);
+
+  let summary = "";
+  if (exitCode === 0) {
+    summary = "Verification passed cleanly with exit code 0.";
+  } else if (fatalErrors.length > 0) {
+    const errorDetails = fatalErrors
+      .map((e) => `  ❌ ${e.filePath}${e.line ? `:${e.line}:${e.column}` : ""} [${e.ruleId || "fatal"}] ${e.message}`)
+      .join("\n");
+    const warningNote = finalWarningCount > 0
+      ? `\n  ℹ️ (${finalWarningCount} warnings suppressed - warnings do not cause verification failure)`
+      : "";
+    summary = `Verification failed (exit code ${exitCode}) due to ${fatalErrors.length} fatal error(s):\n${errorDetails}${warningNote}`;
+  } else {
+    // If no structured errors were detected, grab first non-warning line indicating error
+    const fallback =
+      lines.find((l) => /\b(?:error|fail|cannot find)\b/i.test(l) && !/\bwarning\b/i.test(l)) ||
+      lines[0] ||
+      `Command exited with status ${exitCode}`;
+    const warningNote = finalWarningCount > 0 ? `\n  ℹ️ (${finalWarningCount} warnings ignored)` : "";
+    summary = `Verification failed (exit code ${exitCode}):\n  ❌ ${fallback.trim()}${warningNote}`;
+  }
+
+  return {
+    exitCode,
+    fatalErrors,
+    warnings,
+    errorCount: finalErrorCount,
+    warningCount: finalWarningCount,
+    summary,
+  };
+}

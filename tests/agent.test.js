@@ -17,6 +17,7 @@ import {
   getLineWindow,
   extractCodeContext,
   diagnoseLogErrors,
+  extractVerificationDiagnostics,
 } from "../src/services/logParser.js";
 import { Sandbox } from "../src/services/sandbox.js";
 import { AgentTools } from "../src/agent/tools.js";
@@ -25,6 +26,8 @@ import {
   buildSingleShotPrompt,
   cleanRawCodeOutput,
   applySearchReplace,
+  applySearchReplaceDetailed,
+  parseSearchReplaceBlocks,
   applyUnifiedDiff,
   isTruncatedCode,
   SRE_SYSTEM_PROMPT,
@@ -1185,6 +1188,280 @@ test("Atomic Rollback: Invalid candidate patch is rolled back without leaving di
     assert.equal(result.success, false);
     const diskContent = await tools.getRepoFile("Widget.jsx");
     assert.equal(diskContent, cleanOriginal);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+// =========================================================================
+// Comprehensive Regression Tests: SEARCH_REPLACE, AST Validation & Verification
+// =========================================================================
+
+test("Regression 1: One valid SEARCH_REPLACE block modifies code accurately", () => {
+  const code = [
+    'import { useState } from "react";',
+    'const count = 0;',
+    'export default function Counter() { return <div>{count}</div>; }',
+  ].join("\n");
+
+  const patch = [
+    '<<<<<<< SEARCH',
+    'const count = 0;',
+    '=======',
+    'const [count, setCount] = useState(0);',
+    '>>>>>>> REPLACE',
+  ].join("\n");
+
+  const res = applySearchReplaceDetailed(code, patch);
+  assert.equal(res.success, true);
+  assert.equal(res.blocksCount, 1);
+  assert.equal(res.code.includes('const [count, setCount] = useState(0);'), true);
+  assert.equal(res.code.includes('export default function Counter()'), true);
+});
+
+test("Regression 2: Two valid SEARCH_REPLACE blocks (req.jsx multi-block scenario)", () => {
+  const code = [
+    'import React, { useState } from "react";',
+    'import { Send, CreditCard } from "lucide-react";',
+    'import axios from "axios";',
+    '',
+    'export default function Req() {',
+    '  const [data, setData] = useState([]);',
+    '  return <div><Send /></div>;',
+    '}',
+  ].join("\n");
+
+  const patch = [
+    '<<<<<<< SEARCH',
+    'import { Send, CreditCard } from "lucide-react";',
+    '=======',
+    'import { Send } from "lucide-react";',
+    '>>>>>>> REPLACE',
+    '',
+    '<<<<<<< SEARCH',
+    '  const [data, setData] = useState([]);',
+    '=======',
+    '  const [_data, setData] = useState([]);',
+    '>>>>>>> REPLACE',
+  ].join("\n");
+
+  const res = applySearchReplaceDetailed(code, patch);
+  assert.equal(res.success, true);
+  assert.equal(res.blocksCount, 2);
+  assert.equal(res.code.includes('import { Send } from "lucide-react";'), true);
+  assert.equal(res.code.includes('const [_data, setData] = useState([]);'), true);
+  assert.equal(res.code.includes('CreditCard'), false);
+});
+
+test("Regression 3: Invalid markers rejected (unclosed search, missing separator, nested markers)", () => {
+  const code = 'const x = 1;\n';
+
+  // 3a. Incomplete / unclosed block
+  const unclosed = '<<<<<<< SEARCH\nconst x = 1;\n=======\nconst x = 2;';
+  const resUnclosed = applySearchReplaceDetailed(code, unclosed);
+  assert.equal(resUnclosed.success, false);
+  assert.match(resUnclosed.reason, /block is incomplete/i);
+
+  // 3b. Missing ======= divider
+  const missingDivider = '<<<<<<< SEARCH\nconst x = 1;\n>>>>>>> REPLACE';
+  const resMissing = applySearchReplaceDetailed(code, missingDivider);
+  assert.equal(resMissing.success, false);
+  assert.match(resMissing.reason, /unexpected >>>>>>> REPLACE/i);
+
+  // 3c. Unexpected nested <<<<<<< SEARCH
+  const nested = '<<<<<<< SEARCH\nconst x = 1;\n<<<<<<< SEARCH\n=======\nconst x = 2;\n>>>>>>> REPLACE';
+  const resNested = applySearchReplaceDetailed(code, nested);
+  assert.equal(resNested.success, false);
+  assert.match(resNested.reason, /unexpected <<<<<<< SEARCH/i);
+});
+
+test("Regression 4: Empty response cleanly rejected without touching file", () => {
+  const code = 'const y = 42;\n';
+  const resEmpty = applySearchReplaceDetailed(code, "");
+  assert.equal(resEmpty.success, false);
+  assert.equal(resEmpty.code, null);
+  assert.match(resEmpty.reason, /empty/i);
+
+  const resWhitespace = applySearchReplaceDetailed(code, "   \n\t  ");
+  assert.equal(resWhitespace.success, false);
+  assert.equal(resWhitespace.code, null);
+});
+
+test("Regression 5: Non-matching original code safely rejected without corrupting file", () => {
+  const code = 'const activeUsers = 100;\n';
+  const nonMatchingPatch = [
+    '<<<<<<< SEARCH',
+    'const nonexistentVariable = 999;',
+    '=======',
+    'const nonexistentVariable = 1000;',
+    '>>>>>>> REPLACE',
+  ].join("\n");
+
+  const res = applySearchReplaceDetailed(code, nonMatchingPatch);
+  assert.equal(res.success, false);
+  assert.equal(res.code, null);
+  assert.match(res.reason, /does not match target file/i);
+});
+
+test("Regression 6: Multiple ambiguous matches in source safely rejected", () => {
+  const code = [
+    'function first() {',
+    '  console.log("duplicate");',
+    '}',
+    'function second() {',
+    '  console.log("duplicate");',
+    '}',
+  ].join("\n");
+
+  const ambiguousPatch = [
+    '<<<<<<< SEARCH',
+    '  console.log("duplicate");',
+    '=======',
+    '  console.log("unique");',
+    '>>>>>>> REPLACE',
+  ].join("\n");
+
+  const res = applySearchReplaceDetailed(code, ambiguousPatch);
+  assert.equal(res.success, false);
+  assert.equal(res.code, null);
+  assert.match(res.reason, /ambiguous match/i);
+});
+
+test("Regression 7: Valid JSX with nested components passes AST validation", () => {
+  const validJsx = [
+    'import React from "react";',
+    'export function UserDashboard({ user, notifications }) {',
+    '  return (',
+    '    <section className="dashboard">',
+    '      <header>',
+    '        <h1>Welcome, {user?.name ?? "Guest"}!</h1>',
+    '      </header>',
+    '      <div className="content">',
+    '        {notifications?.length > 0 ? (',
+    '          <ul>',
+    '            {notifications.map((n, i) => (',
+    '              <li key={i} onClick={() => console.log(n.id)}>{n.message}</li>',
+    '            ))}',
+    '          </ul>',
+    '        ) : (',
+    '          <p>No new notifications.</p>',
+    '        )}',
+    '      </div>',
+    '    </section>',
+    '  );',
+    '}',
+  ].join("\n");
+
+  const result = validateModifiedFile('export function UserDashboard() {}', validJsx, 'Dashboard.jsx');
+  assert.equal(result.valid, true);
+  assert.equal(result.reason, undefined);
+});
+
+test("Regression 8: Invalid JSX syntax (unclosed tag) correctly caught by AST validation", () => {
+  const invalidJsx = [
+    'export function BrokenCard() {',
+    '  return (',
+    '    <div className="card">',
+    '      <span>Unclosed span tag',
+    '    </div>',
+    '  );',
+    '}',
+  ].join("\n");
+
+  const result = validateModifiedFile('export function BrokenCard() {}', invalidJsx, 'BrokenCard.jsx');
+  assert.equal(result.valid, false);
+  assert.match(result.reason, /syntax error|expected/i);
+});
+
+test("Regression 9: Verification output parsing isolates 1 fatal error from 20 warnings", () => {
+  const eslintOutputWith20Warnings = [
+    '/home/runner/work/project/project/frontend/src/components/hostel/hostelprofile.jsx',
+    '  36:10  warning  \'user\' is defined but never used                                no-unused-vars',
+    '  42:8   warning  React Hook useEffect has a missing dependency: \'fetchHostel\'       react-hooks/exhaustive-deps',
+    '  55:8   warning  React Hook useEffect has a missing dependency: \'roomId\'            react-hooks/exhaustive-deps',
+    '',
+    '/home/runner/work/project/project/frontend/src/components/user/req.jsx',
+    '  14:5   warning  React Hook useEffect has a missing dependency: \'fetchData\'         react-hooks/exhaustive-deps',
+    '  15:7   error    \'handleSubmit\' is not defined                                    no-undef',
+    '  88:12  warning  React Hook useEffect has a missing dependency: \'token\'             react-hooks/exhaustive-deps',
+    '',
+    '✖ 21 problems (1 error, 20 warnings)',
+    '  0 errors and 0 warnings potentially fixable with the `--fix` option.',
+  ].join("\n");
+
+  const diag = extractVerificationDiagnostics(eslintOutputWith20Warnings, 1);
+  assert.equal(diag.exitCode, 1);
+  assert.equal(diag.errorCount, 1);
+  assert.equal(diag.warningCount, 20);
+  assert.equal(diag.fatalErrors.length, 1);
+  assert.equal(diag.fatalErrors[0].filePath, "frontend/src/components/user/req.jsx");
+  assert.equal(diag.fatalErrors[0].line, 15);
+  assert.equal(diag.fatalErrors[0].column, 7);
+  assert.equal(diag.fatalErrors[0].ruleId, "no-undef");
+  assert.equal(diag.fatalErrors[0].message, "'handleSubmit' is not defined");
+
+  assert.match(diag.summary, /frontend\/src\/components\/user\/req\.jsx:15:7 \[no-undef\] 'handleSubmit' is not defined/);
+  assert.match(diag.summary, /20 warnings suppressed/);
+});
+
+test("Regression 10: Atomic rollback reverts modified files when sandbox verification fails", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "healops-atomic-test-"));
+  try {
+    const sandbox = new Sandbox(tempDir);
+    const tools = new AgentTools({ workspaceDir: tempDir, sandbox });
+
+    const originalWidget = 'export const Widget = () => <div>Clean Original Widget</div>;\n';
+    const originalApp = 'export const App = () => <div>Clean Original App</div>;\n';
+    await tools.applyFilePatch("Widget.jsx", originalWidget);
+    await tools.applyFilePatch("App.jsx", originalApp);
+
+    const mockGroq = {
+      chat: {
+        completions: {
+          create: async () => ({
+            choices: [
+              {
+                finish_reason: "stop",
+                message: {
+                  content: [
+                    '<<<<<<< SEARCH',
+                    '<div>Clean Original Widget</div>',
+                    '=======',
+                    '<div>Candidate Edits Widget</div>',
+                    '>>>>>>> REPLACE',
+                  ].join("\n"),
+                },
+              },
+            ],
+            usage: { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150 },
+          }),
+        },
+      },
+    };
+
+    const agent = new DiagnoserAgent({
+      tools,
+      apiKey: "mock-key",
+      model: "openai/gpt-oss-120b",
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    agent.groq = mockGroq;
+
+    // Execute multi-file remediation with a command that simulates verification exit code 1
+    const result = await agent.runMultiFileRemediation({
+      culprits: [{ targetFile: "Widget.jsx", lineNum: 1, errors: ["error in widget"] }],
+      testCommand: 'node -e "console.error(\'Verification Build Error: exit 1\'); process.exit(1)"',
+      delayMs: 0,
+    });
+
+    assert.equal(result.success, false);
+    assert.match(result.rootCause, /failed verification.*rolled back/i);
+
+    // Verify atomic rollback on disk: both files must match originals byte-for-byte!
+    const diskWidget = await tools.getRepoFile("Widget.jsx");
+    const diskApp = await tools.getRepoFile("App.jsx");
+    assert.equal(diskWidget, originalWidget);
+    assert.equal(diskApp, originalApp);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }

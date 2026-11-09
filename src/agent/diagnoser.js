@@ -9,6 +9,7 @@ import {
   getLineWindow,
   extractCodeContext,
   diagnoseLogErrors,
+  extractVerificationDiagnostics,
 } from "../services/logParser.js";
 import { sleep } from "../config.js";
 import { SRE_SYSTEM_PROMPT, buildRemediationUserPrompt } from "./prompts.js";
@@ -176,89 +177,329 @@ export function applyUnifiedDiff(fullContent, diffText) {
 }
 
 /**
+ * Parse SEARCH/REPLACE blocks using a strict state machine rather than greedy regular expressions.
+ * Accurately extracts multiple blocks, deletions (empty replacement), and rejects unclosed or malformed blocks.
+ *
+ * @param {string} patchText
+ * @returns {{ success: boolean, blocks?: Array<{ search: string, replace: string, startLine: number }>, reason?: string }}
+ */
+export function parseSearchReplaceBlocks(patchText) {
+  if (!patchText || typeof patchText !== "string") {
+    return { success: false, reason: "Empty patch received." };
+  }
+
+  const lines = patchText.replace(/\r\n/g, "\n").split("\n");
+  const blocks = [];
+  let state = "IDLE"; // "IDLE" | "IN_SEARCH" | "IN_REPLACE"
+  let currentSearch = [];
+  let currentReplace = [];
+  let blockStartLine = -1;
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    const trimmed = rawLine.trim();
+
+    if (trimmed.startsWith("<<<<<<< SEARCH")) {
+      if (state !== "IDLE") {
+        return {
+          success: false,
+          reason: `Malformed SEARCH_REPLACE at line ${i + 1}: unexpected <<<<<<< SEARCH marker before completing previous block.`,
+        };
+      }
+      state = "IN_SEARCH";
+      currentSearch = [];
+      currentReplace = [];
+      blockStartLine = i + 1;
+    } else if (trimmed.startsWith("=======")) {
+      if (state !== "IN_SEARCH") {
+        return {
+          success: false,
+          reason: `Malformed SEARCH_REPLACE at line ${i + 1}: unexpected ======= marker outside of search block.`,
+        };
+      }
+      state = "IN_REPLACE";
+    } else if (trimmed.startsWith(">>>>>>> REPLACE")) {
+      if (state !== "IN_REPLACE") {
+        return {
+          success: false,
+          reason: `Malformed SEARCH_REPLACE at line ${i + 1}: unexpected >>>>>>> REPLACE marker before ======= divider.`,
+        };
+      }
+      const searchStr = currentSearch.join("\n");
+      const replaceStr = currentReplace.join("\n");
+
+      if (searchStr.length === 0 && searchStr.trim() === "") {
+        return {
+          success: false,
+          reason: `Malformed SEARCH_REPLACE starting at line ${blockStartLine}: SEARCH block cannot be empty.`,
+        };
+      }
+
+      blocks.push({
+        search: searchStr,
+        replace: replaceStr,
+        startLine: blockStartLine,
+      });
+      state = "IDLE";
+    } else {
+      if (state === "IN_SEARCH") {
+        currentSearch.push(rawLine);
+      } else if (state === "IN_REPLACE") {
+        currentReplace.push(rawLine);
+      }
+    }
+  }
+
+  if (state !== "IDLE") {
+    return {
+      success: false,
+      reason: `Malformed SEARCH_REPLACE starting at line ${blockStartLine}: block is incomplete (missing closing marker).`,
+    };
+  }
+
+  if (blocks.length === 0) {
+    return {
+      success: false,
+      reason: "No valid SEARCH_REPLACE blocks found in patch.",
+    };
+  }
+
+  return {
+    success: true,
+    blocks,
+  };
+}
+
+/**
+ * Locate a search snippet uniquely within file content.
+ * Enforces strict single-match semantics: rejects non-matching code and ambiguous multiple matches.
+ *
+ * @param {string} content
+ * @param {string} rawSearch
+ * @param {string} rawReplace
+ * @returns {{ found: boolean, start?: number, end?: number, replace?: string, reason?: string }}
+ */
+function findMatchInContent(content, rawSearch, rawReplace) {
+  if (!rawSearch || rawSearch.length === 0) {
+    return { found: false, reason: "Search block is empty." };
+  }
+
+  // 1. Exact match
+  // 1a. If deletion (rawReplace === ""), prefer exact line deletion with trailing newline
+  if (rawReplace === "" && content.includes(rawSearch + "\n")) {
+    const firstIdx = content.indexOf(rawSearch + "\n");
+    const secondIdx = content.indexOf(rawSearch + "\n", firstIdx + 1);
+    if (secondIdx !== -1) {
+      return { found: false, reason: "Ambiguous match (search block matches multiple locations in file)." };
+    }
+    return { found: true, start: firstIdx, end: firstIdx + rawSearch.length + 1, replace: "" };
+  }
+
+  // 1b. Exact substring match
+  if (content.includes(rawSearch)) {
+    const firstIdx = content.indexOf(rawSearch);
+    const secondIdx = content.indexOf(rawSearch, firstIdx + 1);
+    if (secondIdx !== -1) {
+      return { found: false, reason: "Ambiguous match (search block matches multiple locations in file)." };
+    }
+    return { found: true, start: firstIdx, end: firstIdx + rawSearch.length, replace: rawReplace };
+  }
+
+  // 2. Line numbers stripped match
+  const strippedSearch = rawSearch.replace(/^\s*\d+[:|]?\s*/gm, "");
+  const strippedReplace = rawReplace.replace(/^\s*\d+[:|]?\s*/gm, "");
+
+  if (strippedSearch !== rawSearch) {
+    if (strippedReplace === "" && content.includes(strippedSearch + "\n")) {
+      const firstIdx = content.indexOf(strippedSearch + "\n");
+      const secondIdx = content.indexOf(strippedSearch + "\n", firstIdx + 1);
+      if (secondIdx !== -1) {
+        return { found: false, reason: "Ambiguous match after stripping line numbers." };
+      }
+      return { found: true, start: firstIdx, end: firstIdx + strippedSearch.length + 1, replace: "" };
+    }
+
+    if (content.includes(strippedSearch)) {
+      const firstIdx = content.indexOf(strippedSearch);
+      const secondIdx = content.indexOf(strippedSearch, firstIdx + 1);
+      if (secondIdx !== -1) {
+        return { found: false, reason: "Ambiguous match after stripping line numbers." };
+      }
+      return { found: true, start: firstIdx, end: firstIdx + strippedSearch.length, replace: strippedReplace };
+    }
+  }
+
+  // 3. Trimmed exact match (only if search is non-trivial and unique)
+  const trimmedSearch = (strippedSearch || rawSearch).trim();
+  const trimmedReplace = (strippedReplace || rawReplace).trim();
+  if (trimmedSearch.length > 0 && content.includes(trimmedSearch)) {
+    const firstIdx = content.indexOf(trimmedSearch);
+    const secondIdx = content.indexOf(trimmedSearch, firstIdx + 1);
+    if (secondIdx !== -1) {
+      return { found: false, reason: "Ambiguous match (trimmed search matches multiple locations in file)." };
+    }
+    return { found: true, start: firstIdx, end: firstIdx + trimmedSearch.length, replace: trimmedReplace };
+  }
+
+  // 4. Line-by-line whitespace-flexible match
+  const searchLines = (strippedSearch || rawSearch).split("\n");
+  const contentLines = content.split("\n");
+
+  if (searchLines.length > 0 && searchLines.length <= contentLines.length) {
+    const matchingIndices = [];
+    for (let i = 0; i <= contentLines.length - searchLines.length; i++) {
+      let isMatch = true;
+      for (let j = 0; j < searchLines.length; j++) {
+        if (contentLines[i + j].trim() !== searchLines[j].trim()) {
+          isMatch = false;
+          break;
+        }
+      }
+      if (isMatch) {
+        matchingIndices.push(i);
+      }
+    }
+
+    if (matchingIndices.length > 1) {
+      return { found: false, reason: "Ambiguous match (fuzzy line search matched multiple locations in file)." };
+    }
+
+    if (matchingIndices.length === 1) {
+      const foundIdx = matchingIndices[0];
+      let charStart = 0;
+      for (let i = 0; i < foundIdx; i++) {
+        charStart += contentLines[i].length + 1;
+      }
+
+      let charEnd = charStart;
+      for (let i = 0; i < searchLines.length; i++) {
+        charEnd += contentLines[foundIdx + i].length;
+        if (foundIdx + i < contentLines.length - 1) {
+          charEnd += 1;
+        }
+      }
+
+      const baseIndent = contentLines[foundIdx].match(/^\s*/)?.[0] || "";
+      const replaceLines = (strippedReplace || rawReplace).split("\n");
+      const indentedReplace = replaceLines
+        .map((l) => (l.trim() ? baseIndent + l.trimStart() : ""))
+        .join("\n");
+
+      return {
+        found: true,
+        start: charStart,
+        end: charEnd,
+        replace: strippedReplace === "" ? "" : indentedReplace,
+      };
+    }
+  }
+
+  return { found: false, reason: "Search text does not match target file." };
+}
+
+/**
+ * Surgically apply SEARCH/REPLACE blocks or unified diff to file content with detailed reporting.
+ * - Parses multiple blocks independently
+ * - Validates that every search block uniquely matches before modifying
+ * - Validates that replacement blocks do not overlap
+ * - Applies all blocks atomically from bottom to top
+ * - Returns structured error reason if matching or validation fails
+ *
+ * @param {string} fullContent
+ * @param {string} patchText
+ * @returns {{ success: boolean, code: string|null, reason: string|null, blocksCount: number }}
+ */
+export function applySearchReplaceDetailed(fullContent, patchText) {
+  if (!fullContent || typeof fullContent !== "string") {
+    return { success: false, code: null, reason: "Original file content is empty.", blocksCount: 0 };
+  }
+  if (!patchText || typeof patchText !== "string") {
+    return { success: false, code: null, reason: "Patch text is empty.", blocksCount: 0 };
+  }
+
+  const isCrlf = fullContent.includes("\r\n");
+  const normalizedContent = fullContent.replace(/\r\n/g, "\n");
+  const normalizedPatch = patchText.replace(/\r\n/g, "\n");
+
+  const parsed = parseSearchReplaceBlocks(normalizedPatch);
+  if (!parsed.success) {
+    // Fallback to unified diff parser if SEARCH/REPLACE parsing failed but unified markers exist
+    if (normalizedPatch.includes("@@ -") || normalizedPatch.includes("--- a/")) {
+      const unifiedResult = applyUnifiedDiff(normalizedContent, normalizedPatch);
+      if (unifiedResult) {
+        return {
+          success: true,
+          code: isCrlf ? unifiedResult.replace(/\n/g, "\r\n") : unifiedResult,
+          reason: null,
+          blocksCount: 1,
+        };
+      }
+      return { success: false, code: null, reason: "Malformed unified diff could not be applied.", blocksCount: 0 };
+    }
+    return { success: false, code: null, reason: parsed.reason, blocksCount: 0 };
+  }
+
+  const matches = [];
+  for (let b = 0; b < parsed.blocks.length; b++) {
+    const block = parsed.blocks[b];
+    const matchResult = findMatchInContent(normalizedContent, block.search, block.replace);
+    if (!matchResult.found) {
+      return {
+        success: false,
+        code: null,
+        reason: `Block ${b + 1}: ${matchResult.reason}`,
+        blocksCount: parsed.blocks.length,
+      };
+    }
+
+    matches.push({
+      start: matchResult.start,
+      end: matchResult.end,
+      replace: matchResult.replace,
+      blockNum: b + 1,
+    });
+  }
+
+  // Check for overlapping matches
+  matches.sort((a, b) => a.start - b.start);
+  for (let i = 0; i < matches.length - 1; i++) {
+    if (matches[i].end > matches[i + 1].start) {
+      return {
+        success: false,
+        code: null,
+        reason: `Overlapping blocks detected: Block ${matches[i].blockNum} and Block ${matches[i + 1].blockNum}.`,
+        blocksCount: parsed.blocks.length,
+      };
+    }
+  }
+
+  // Apply atomically in reverse order (bottom to top)
+  matches.sort((a, b) => b.start - a.start);
+  let updated = normalizedContent;
+  for (const m of matches) {
+    updated = updated.slice(0, m.start) + m.replace + updated.slice(m.end);
+  }
+
+  const finalCode = isCrlf ? updated.replace(/\n/g, "\r\n") : updated;
+  return {
+    success: true,
+    code: finalCode,
+    reason: null,
+    blocksCount: parsed.blocks.length,
+  };
+}
+
+/**
  * Surgically apply SEARCH/REPLACE blocks or unified diff to file content.
+ * Returns updated content string, or null on failure.
+ *
  * @param {string} fullContent
  * @param {string} patchText
  * @returns {string|null}
  */
 export function applySearchReplace(fullContent, patchText) {
-  if (!fullContent || !patchText) return null;
-  const isCrlf = fullContent.includes("\r\n");
-  const normalizedContent = fullContent.replace(/\r\n/g, "\n");
-  const normalizedPatch = patchText.replace(/\r\n/g, "\n");
-
-  const regex = /<<<<<<< SEARCH[^\n]*\n([\s\S]*?)\n=======[^\n]*(?:\n([\s\S]*?))?\n>>>>>>> REPLACE/g;
-  let updated = normalizedContent;
-  let matches = 0;
-  let m;
-
-  while ((m = regex.exec(normalizedPatch)) !== null) {
-    const search = m[1];
-    const replace = m[2] !== undefined ? m[2] : "";
-    const strippedSearch = search.replace(/^\s*\d+[:|]?\s*/gm, "");
-    const strippedReplace = replace.replace(/^\s*\d+[:|]?\s*/gm, "");
-
-    if (replace === "" && updated.includes(search + "\n")) {
-      updated = updated.replace(search + "\n", "");
-      matches++;
-    } else if (strippedReplace === "" && updated.includes(strippedSearch + "\n")) {
-      updated = updated.replace(strippedSearch + "\n", "");
-      matches++;
-    } else if (updated.includes(search)) {
-      updated = updated.replace(search, replace);
-      matches++;
-    } else if (updated.includes(strippedSearch)) {
-      updated = updated.replace(strippedSearch, strippedReplace);
-      matches++;
-    } else if (updated.includes(search.trim())) {
-      updated = updated.replace(search.trim(), replace.trim());
-      matches++;
-    } else if (updated.includes(strippedSearch.trim())) {
-      updated = updated.replace(strippedSearch.trim(), strippedReplace.trim());
-      matches++;
-    } else {
-      // Fuzzy line match ignoring leading/trailing whitespace and line numbers
-      const searchLines = (strippedSearch || search)
-        .split("\n")
-        .map((l) => l.replace(/^\s*\d+[:|]?\s*/, "").trim());
-
-      if (searchLines.length > 0) {
-        const contentLines = updated.split("\n");
-        let foundIdx = -1;
-        for (let i = 0; i <= contentLines.length - searchLines.length; i++) {
-          const slice = contentLines.slice(i, i + searchLines.length).map((l) => l.trim());
-          if (slice.every((line, idx) => line === searchLines[idx])) {
-            foundIdx = i;
-            break;
-          }
-        }
-        if (foundIdx !== -1) {
-          const indent = contentLines[foundIdx].match(/^\s*/)?.[0] || "";
-          const indentedReplace = strippedReplace
-            .split("\n")
-            .map((l) => (l.trim() ? indent + l.trimStart() : ""))
-            .join("\n");
-          contentLines.splice(foundIdx, searchLines.length, indentedReplace);
-          updated = contentLines.join("\n");
-          matches++;
-        }
-      }
-    }
-  }
-
-  if (matches > 0) {
-    return isCrlf ? updated.replace(/\n/g, "\r\n") : updated;
-  }
-
-  // Fallback to unified diff parser if SEARCH/REPLACE produced 0 matches
-  if (normalizedPatch.includes("@@ -") || normalizedPatch.includes("--- a/")) {
-    const unifiedResult = applyUnifiedDiff(normalizedContent, normalizedPatch);
-    if (unifiedResult) {
-      return isCrlf ? unifiedResult.replace(/\n/g, "\r\n") : unifiedResult;
-    }
-  }
-
-  return null;
+  const result = applySearchReplaceDetailed(fullContent, patchText);
+  return result.success ? result.code : null;
 }
 
 /**
@@ -268,14 +509,11 @@ export function applySearchReplace(fullContent, patchText) {
  */
 export function extractReplaceBlocks(patchText) {
   if (!patchText) return [];
-  const normalized = patchText.replace(/\r\n/g, "\n");
-  const regex = /<<<<<<< SEARCH[^\n]*\n([\s\S]*?)\n=======[^\n]*(?:\n([\s\S]*?))?\n>>>>>>> REPLACE/g;
-  const blocks = [];
-  let m;
-  while ((m = regex.exec(normalized)) !== null) {
-    blocks.push(m[2] !== undefined ? m[2] : "");
+  const parsed = parseSearchReplaceBlocks(patchText);
+  if (parsed.success && parsed.blocks) {
+    return parsed.blocks.map((b) => b.replace);
   }
-  return blocks;
+  return [];
 }
 
 
@@ -455,8 +693,9 @@ export class DiagnoserAgent {
       };
     } else {
       const failureOutput = (testResult.stderr || testResult.stdout || "").trim();
+      const diag = extractVerificationDiagnostics(failureOutput, testResult.exitCode);
       this.logger.warn(
-        `❌ Single-shot remediation was unsuccessful (exit code: ${testResult.exitCode}). Rolling back unverified changes...`
+        `❌ Single-shot remediation was unsuccessful (exit code: ${testResult.exitCode}).\nCommand: '${testCommand}'\n${diag.summary}\nRolling back unverified changes...`
       );
       if (originalContent && !originalContent.startsWith("Error:")) {
         await this.tools.applyFilePatch(targetFile, originalContent);
@@ -464,11 +703,11 @@ export class DiagnoserAgent {
       }
       return {
         success: false,
-        rootCause: `Single-shot remediation failed verification in \`${targetFile}\`.`,
+        rootCause: `Single-shot remediation failed verification in \`${targetFile}\`:\n${diag.summary}`,
         modifiedFiles: [],
         fixedCode,
         testCommand,
-        testOutput: testResult.stderr || testResult.stdout || `Failed with exit code ${testResult.exitCode}`,
+        testOutput: failureOutput || `Failed with exit code ${testResult.exitCode}`,
         iterations: 1,
       };
     }
@@ -734,13 +973,15 @@ export class DiagnoserAgent {
         }
 
         let finalCode = "";
-        const searchReplaced = applySearchReplace(fullContent, cleaned);
-        if (searchReplaced) {
-          finalCode = searchReplaced;
+        const patchResult = applySearchReplaceDetailed(fullContent, cleaned);
+        if (patchResult.success) {
+          finalCode = patchResult.code;
         } else if (isFullFile && cleaned.length >= fullContent.length * 0.7) {
           finalCode = cleaned;
         } else {
-          this.logger.warn(`Could not safely match diff markers for '${targetFile}'. Skipping to prevent corruption.`);
+          this.logger.warn(
+            `Could not safely match diff markers for '${targetFile}': ${patchResult.reason || "unknown matching failure"}. Skipping to prevent corruption.`
+          );
           continue;
         }
 
@@ -807,9 +1048,9 @@ export class DiagnoserAgent {
       };
     } else {
       const failureOutput = (testResult.stderr || testResult.stdout || "").trim();
-      const fatalDiag = extractFatalErrorLine(failureOutput) || "Command exited with status " + testResult.exitCode;
+      const diag = extractVerificationDiagnostics(failureOutput, testResult.exitCode);
       this.logger.error(
-        `❌ Multi-file remediation failed verification (exit code: ${testResult.exitCode}).\nCommand: '${testCommand}'\nDiagnostic: ${fatalDiag}\nFull verification output:\n${failureOutput}`
+        `❌ Multi-file remediation failed verification (exit code: ${testResult.exitCode}).\nCommand: '${testCommand}'\n${diag.summary}\nFull verification output:\n${failureOutput}`
       );
 
       // Atomic Rollback: Revert all files modified in Phase 2 so sandbox is not left corrupted
