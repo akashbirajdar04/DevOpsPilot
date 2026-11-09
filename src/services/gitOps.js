@@ -156,16 +156,16 @@ export class GitOpsService {
    * @param {object} params
    * @returns {Promise<{ prUrl: string, prNumber: number }>}
    */
-  async openPullRequest({ runId, headBranch, fixBranch, rootCause, modifiedFiles, testCommand, testOutput, iterations }) {
+  async openPullRequest({ runId, headBranch, fixBranch, rootCause, modifiedFiles, testCommand, testOutput, iterations, report = null, customBody = null }) {
     const title = `fix(ci): automated remediation for failed run #${runId}`;
-    const body = formatPRBody({
+    const body = customBody || (report?.toPRMarkdown ? report.toPRMarkdown() : formatPRBody({
       runId,
       rootCause,
       modifiedFiles,
       testCommand,
       testOutput,
       iterations,
-    });
+    }));
 
     // Check if PR already exists
     const { data: existingPRs } = await this.octokit.rest.pulls.list({

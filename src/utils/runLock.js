@@ -1,19 +1,73 @@
 /**
  * In-Flight Run Locking & Idempotency Service.
- * Ensures a single active remediation execution per (repoId, runId, runAttempt).
+ * Ensures a single active remediation execution per (repoId, runId, runAttempt, deliveryId).
  * Prevents concurrent webhook race conditions, duplicate LLM requests, and token waste.
+ * Persists completed runs across process restarts to avoid re-triggering on container reboots.
  */
+
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 
 export class RunLock {
   /**
-   * @param {number} [ttlMs=180000] - Lock expiration in milliseconds (default: 3 minutes)
+   * @param {object|number} [optionsOrTtl=180000] - Configuration options or ttlMs
    * @param {number} [completedTtlMs=3600000] - Completed run retention in milliseconds (default: 1 hour)
    */
-  constructor(ttlMs = 180000, completedTtlMs = 3600000) {
+  constructor(optionsOrTtl = 180000, completedTtlMs = 3600000) {
+    let ttl = 180000;
+    let completedTtl = 3600000;
+    let persistPath = path.join(os.tmpdir(), "healops-completed-runs.json");
+
+    if (typeof optionsOrTtl === "object" && optionsOrTtl !== null) {
+      ttl = optionsOrTtl.ttlMs || 180000;
+      completedTtl = optionsOrTtl.completedTtlMs || 3600000;
+      if (optionsOrTtl.persistPath) persistPath = optionsOrTtl.persistPath;
+    } else if (typeof optionsOrTtl === "number") {
+      ttl = optionsOrTtl;
+      completedTtl = completedTtlMs;
+    }
+
+    this.ttlMs = ttl;
+    this.completedTtlMs = completedTtl;
+    this.persistPath = persistPath;
+
     this.activeRuns = new Map(); // key -> timeoutHandle
-    this.completedRuns = new Map(); // key -> timeoutHandle
-    this.ttlMs = ttlMs;
-    this.completedTtlMs = completedTtlMs;
+    this.completedRuns = new Map(); // key -> expirationTimestamp
+    this.processedDeliveries = new Set(); // deliveryId
+
+    // Load persisted completed runs from disk
+    this._loadPersistedState();
+  }
+
+  _loadPersistedState() {
+    try {
+      if (fs.existsSync(this.persistPath)) {
+        const raw = fs.readFileSync(this.persistPath, "utf-8");
+        const entries = JSON.parse(raw);
+        const now = Date.now();
+        if (Array.isArray(entries)) {
+          for (const item of entries) {
+            if (item.expiresAt > now) {
+              this.completedRuns.set(item.key, item.expiresAt);
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  _savePersistedState() {
+    try {
+      const now = Date.now();
+      const entries = [];
+      for (const [key, expiresAt] of this.completedRuns.entries()) {
+        if (expiresAt > now) {
+          entries.push({ key, expiresAt });
+        }
+      }
+      fs.writeFileSync(this.persistPath, JSON.stringify(entries), "utf-8");
+    } catch {}
   }
 
   /**
@@ -33,19 +87,51 @@ export class RunLock {
 
   /**
    * Attempt to acquire lock for a given run (or composite repoId + runId + runAttempt).
-   * Rejects if currently in-flight OR if already completed.
+   * Rejects if deliveryId already seen, or if currently in-flight OR if already completed.
    *
-   * @param {string|number} repoId
+   * @param {string|number|object} repoIdOrOptions
    * @param {string|number} [runId]
    * @param {string|number} [runAttempt]
+   * @param {string} [deliveryId]
    * @returns {boolean} True if acquired, false if already locked or completed
    */
-  acquire(repoId, runId = null, runAttempt = null) {
-    if (repoId === null || repoId === undefined || repoId === "") return false;
-    const key = this.buildKey(repoId, runId, runAttempt);
+  acquire(repoIdOrOptions, runId = null, runAttempt = null, deliveryId = null) {
+    let repoId = repoIdOrOptions;
+    let rId = runId;
+    let attempt = runAttempt;
+    let delId = deliveryId;
 
-    // If already completed or currently in-flight, reject
-    if (this.completedRuns.has(key) || this.activeRuns.has(key)) {
+    if (typeof repoIdOrOptions === "object" && repoIdOrOptions !== null) {
+      repoId = repoIdOrOptions.repoId;
+      rId = repoIdOrOptions.runId;
+      attempt = repoIdOrOptions.runAttempt;
+      delId = repoIdOrOptions.deliveryId;
+    }
+
+    if (!repoId) return false;
+
+    // 1. Webhook delivery ID check (drop exact duplicate deliveries)
+    if (delId) {
+      if (this.processedDeliveries.has(delId)) {
+        return false;
+      }
+      this.processedDeliveries.add(delId);
+    }
+
+    const key = this.buildKey(repoId, rId, attempt);
+    const now = Date.now();
+
+    // 2. Check if already completed (including persisted across restarts)
+    if (this.completedRuns.has(key)) {
+      const exp = this.completedRuns.get(key);
+      if (exp > now) {
+        return false;
+      }
+      this.completedRuns.delete(key);
+    }
+
+    // 3. Check if currently in-flight
+    if (this.activeRuns.has(key)) {
       return false;
     }
 
@@ -64,15 +150,27 @@ export class RunLock {
   /**
    * Release lock for a given run. Optionally mark as completed for idempotency.
    *
-   * @param {string|number} repoId
+   * @param {string|number|object} repoIdOrOptions
    * @param {string|number} [runId]
    * @param {string|number} [runAttempt]
    * @param {boolean} [markAsCompleted=false]
    * @returns {boolean} True if released, false if not held
    */
-  release(repoId, runId = null, runAttempt = null, markAsCompleted = false) {
-    if (repoId === null || repoId === undefined || repoId === "") return false;
-    const key = this.buildKey(repoId, runId, runAttempt);
+  release(repoIdOrOptions, runId = null, runAttempt = null, markAsCompleted = false) {
+    let repoId = repoIdOrOptions;
+    let rId = runId;
+    let attempt = runAttempt;
+    let completed = markAsCompleted;
+
+    if (typeof repoIdOrOptions === "object" && repoIdOrOptions !== null) {
+      repoId = repoIdOrOptions.repoId;
+      rId = repoIdOrOptions.runId;
+      attempt = repoIdOrOptions.runAttempt;
+      completed = repoIdOrOptions.markAsCompleted ?? false;
+    }
+
+    if (!repoId) return false;
+    const key = this.buildKey(repoId, rId, attempt);
 
     let released = false;
     if (this.activeRuns.has(key)) {
@@ -81,12 +179,10 @@ export class RunLock {
       released = true;
     }
 
-    if (markAsCompleted) {
-      const cTimer = setTimeout(() => {
-        this.completedRuns.delete(key);
-      }, this.completedTtlMs);
-      if (cTimer.unref) cTimer.unref();
-      this.completedRuns.set(key, cTimer);
+    if (completed) {
+      const expiresAt = Date.now() + this.completedTtlMs;
+      this.completedRuns.set(key, expiresAt);
+      this._savePersistedState();
     }
 
     return released;
@@ -115,23 +211,31 @@ export class RunLock {
   isCompleted(repoId, runId = null, runAttempt = null) {
     if (!repoId) return false;
     const key = this.buildKey(repoId, runId, runAttempt);
-    return this.completedRuns.has(key);
+    const expiresAt = this.completedRuns.get(key);
+    if (!expiresAt) return false;
+    if (expiresAt < Date.now()) {
+      this.completedRuns.delete(key);
+      return false;
+    }
+    return true;
   }
 
   /**
-   * Clear all active locks and completed records (useful for testing or shutdown).
+   * Clear all active locks and completed records.
    */
   clear() {
     for (const timer of this.activeRuns.values()) {
       clearTimeout(timer);
     }
-    for (const timer of this.completedRuns.values()) {
-      clearTimeout(timer);
-    }
     this.activeRuns.clear();
     this.completedRuns.clear();
+    this.processedDeliveries.clear();
+    try {
+      if (fs.existsSync(this.persistPath)) {
+        fs.unlinkSync(this.persistPath);
+      }
+    } catch {}
   }
 }
 
 export const globalRunLock = new RunLock();
-

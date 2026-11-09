@@ -44,9 +44,10 @@ export default function healOpsApp(app, optionsOrBootTime) {
     // -------------------------------------------------------------------------
     // Guard 0: In-Flight Run Locking & Idempotency Protection
     // -------------------------------------------------------------------------
-    if (!globalRunLock.acquire(repoId, runId, runAttempt)) {
+    const deliveryId = context.id;
+    if (!globalRunLock.acquire(repoId, runId, runAttempt, deliveryId)) {
       app.log.warn(
-        `[IDEMPOTENCY GUARD] Workflow Run #${runId} (Attempt ${runAttempt}, Repo: ${repoId}) is already processed or actively running. Dropping duplicate event.`
+        `[IDEMPOTENCY GUARD] Workflow Run #${runId} (Attempt ${runAttempt}, Repo: ${repoId}, Delivery: ${deliveryId}) is already processed or actively running. Dropping duplicate event.`
       );
       return;
     }
@@ -218,80 +219,33 @@ export default function healOpsApp(app, optionsOrBootTime) {
       const agent = new DiagnoserAgent({
         tools,
         apiKey: process.env.GROQ_API_KEY,
-        model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
+        model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
         logger: app.log,
       });
 
-      // Dynamically select verification command for sandbox
-      let testCommand = "npm test --if-present";
-      const primaryTargetFile = culprits[0].targetFile;
-      const targetSubDir = primaryTargetFile.includes("/") ? primaryTargetFile.split("/")[0] : "";
-      const rootPkgPath = path.join(workspaceDir, "package.json");
-      const subPkgPath = targetSubDir ? path.join(workspaceDir, targetSubDir, "package.json") : null;
-
-      try {
-        if (subPkgPath) {
-          const subPkgRaw = await fs.readFile(subPkgPath, "utf-8");
-          const subPkg = JSON.parse(subPkgRaw);
-          const cmds = [];
-          if (subPkg.scripts?.lint) {
-            cmds.push(`npm run lint --prefix ${targetSubDir}`);
-          }
-          if (subPkg.scripts?.build) {
-            cmds.push(`npm run build --prefix ${targetSubDir}`);
-          }
-          if (subPkg.scripts?.test) {
-            cmds.push(`npm test --prefix ${targetSubDir}`);
-          }
-          if (cmds.length > 0) {
-            testCommand = cmds.join(" && ");
-          } else {
-            testCommand = `npm test --if-present --prefix ${targetSubDir}`;
-          }
-        } else {
-          const rootPkgRaw = await fs.readFile(rootPkgPath, "utf-8");
-          const rootPkg = JSON.parse(rootPkgRaw);
-          const cmds = [];
-          if (rootPkg.scripts?.lint) {
-            cmds.push("npm run lint");
-          }
-          if (rootPkg.scripts?.build) {
-            cmds.push("npm run build");
-          }
-          if (rootPkg.scripts?.test) {
-            cmds.push("npm test");
-          }
-          if (cmds.length > 0) {
-            testCommand = cmds.join(" && ");
-          } else {
-            testCommand = "npm test --if-present";
-          }
-        }
-      } catch {
-        testCommand = "npm test --if-present";
-      }
-
       app.log.info(`Dispatching deterministic remediation for Run #${runId} across ${culprits.length} file(s)...`);
-      const remediation = await agent.runMultiFileRemediation({
+      const report = await agent.runDeterministicRemediationPipeline({
         culprits,
-        testCommand,
-        delayMs: parseInt(process.env.GROQ_TURN_DELAY_MS || "2000", 10),
+        repo: `${owner}/${repo}`,
+        runId,
+        runAttempt,
+        deliveryId,
+        headBranch,
       });
 
       // -----------------------------------------------------------------------
-      // Step 5: PR Delivery (if verified) or Clean Exit (if unverified)
+      // Step 5: PR Delivery (only if VERIFIED) or Clean Exit (if unverified)
       // -----------------------------------------------------------------------
-      if (!remediation.success) {
+      if (report.finalState !== "VERIFIED") {
         app.log.warn(
-          `Remediation was unsuccessful for Run #${runId}. Exiting cleanly without opening a PR.`
+          `Remediation completed with state '${report.finalState}' for Run #${runId}. Exiting cleanly without opening a PR.`
         );
         return;
       }
 
       app.log.info(
-        `🎉 Multi-file remediation passed! Pushing to fix/ci-failure-${runId} and opening PR with ${remediation.modifiedFiles.length} file(s)...`
+        `🎉 Multi-file remediation VERIFIED! Pushing to fix/ci-failure-${runId} and opening PR with ${report.modifiedFiles.length} file(s)...`
       );
-
 
       const gitOps = new GitOpsService(context.octokit, owner, repo);
       const fixBranch = await gitOps.createFixBranch(runId, headBranch);
@@ -300,18 +254,14 @@ export default function healOpsApp(app, optionsOrBootTime) {
       await gitOps.commitFiles(
         fixBranch,
         filesMap,
-        `fix(ci): single-shot deterministic remediation for run #${runId}\n\n${remediation.rootCause}`
+        `fix(ci): verified deterministic remediation for run #${runId}\n\n${report.rootCause}`
       );
 
       const prResult = await gitOps.openPullRequest({
         runId,
         headBranch,
         fixBranch,
-        rootCause: remediation.rootCause,
-        modifiedFiles: remediation.modifiedFiles,
-        testCommand: remediation.testCommand,
-        testOutput: remediation.testOutput,
-        iterations: 1,
+        report,
       });
 
       app.log.info(`🎉 Successfully opened Pull Request: ${prResult.prUrl} (#${prResult.prNumber})`);

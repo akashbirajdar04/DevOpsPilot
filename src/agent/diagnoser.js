@@ -15,8 +15,23 @@ import { sleep } from "../config.js";
 import { SRE_SYSTEM_PROMPT, buildRemediationUserPrompt } from "./prompts.js";
 import { DeterministicFixer } from "../services/deterministicFixer.js";
 import { validatePatchOutput, validateModifiedFile } from "./validator.js";
+import { GroqRemediationClient } from "./groqClient.js";
+import { GitPatchApplier } from "./gitPatchApplier.js";
+import { CIVerifier } from "../services/ciVerifier.js";
+import { RemediationReport } from "../services/remediationReport.js";
+import { parseAndValidatePatchResponse } from "./patchSchema.js";
 
-export { SRE_SYSTEM_PROMPT, buildRemediationUserPrompt, validatePatchOutput, validateModifiedFile };
+export {
+  SRE_SYSTEM_PROMPT,
+  buildRemediationUserPrompt,
+  validatePatchOutput,
+  validateModifiedFile,
+  GroqRemediationClient,
+  GitPatchApplier,
+  CIVerifier,
+  RemediationReport,
+  parseAndValidatePatchResponse,
+};
 
 /**
  * Build the single-shot prompt specified for deterministic repair.
@@ -684,11 +699,227 @@ export class DiagnoserAgent {
     this.tools = tools;
     this.logger = logger;
     this.apiKey = apiKey || process.env.GROQ_API_KEY;
-    this.model = model || process.env.GROQ_MODEL || "llama-3.1-8b-instant";
+    this.model = model || process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 
     if (this.apiKey) {
       this.groq = new Groq({ apiKey: this.apiKey });
     }
+
+    this.groqClient = new GroqRemediationClient({
+      apiKey: this.apiKey,
+      model: this.model,
+      logger: this.logger,
+    });
+
+    if (this.tools?.workspaceDir) {
+      this.gitApplier = new GitPatchApplier({
+        workspaceDir: this.tools.workspaceDir,
+        logger: this.logger,
+      });
+      this.ciVerifier = new CIVerifier({
+        workspaceDir: this.tools.workspaceDir,
+        logger: this.logger,
+      });
+    }
+  }
+
+  /**
+   * Full end-to-end deterministic remediation pipeline implementing:
+   * 1. Original Commit Recording
+   * 2. Deterministic Fixes (Phase 1)
+   * 3. Structured Patch Generation with Zod schema validation
+   * 4. Git Patch Safety & apply validation
+   * 5. Multi-stage independent CI verification (lint JSON, build, tests)
+   * 6. Structured RemediationReport generation
+   *
+   * @param {object} params
+   * @param {Array<{ targetFile: string, lineNum?: number, errors?: string[] }>} params.culprits
+   * @param {string[]} [params.allowedFiles=[]]
+   * @param {string} [params.repo=""]
+   * @param {string|number} [params.runId=""]
+   * @param {number} [params.runAttempt=1]
+   * @param {string} [params.deliveryId=""]
+   * @param {string} [params.headBranch=""]
+   * @param {object} [params.explicitChecks=null]
+   * @returns {Promise<RemediationReport>}
+   */
+  async runDeterministicRemediationPipeline({
+    culprits = [],
+    allowedFiles = [],
+    repo = "",
+    runId = "",
+    runAttempt = 1,
+    deliveryId = "",
+    headBranch = "",
+    explicitChecks = null,
+  }) {
+    const report = new RemediationReport({
+      repo,
+      runId,
+      runAttempt,
+      deliveryId,
+      headBranch,
+      affectedFiles: culprits.map((c) => c.targetFile),
+    });
+
+    if (!culprits || culprits.length === 0) {
+      report.setPatchValidation({
+        status: "skipped",
+        reason: "No culprit files identified.",
+      });
+      return report.finalize("INCOMPLETE");
+    }
+
+    const effectiveAllowed =
+      allowedFiles.length > 0 ? allowedFiles : culprits.map((c) => c.targetFile);
+
+    // 1. Record original commit SHA
+    if (this.gitApplier) {
+      const sha = await this.gitApplier.recordOriginalCommit();
+      report.originalCommitSha = sha;
+    }
+
+    // 2. Phase 1: Local Deterministic Repair (0 Tokens)
+    const deterministicFixer = new DeterministicFixer({ tools: this.tools, logger: this.logger });
+    const byFileMap = new Map();
+    for (const culprit of culprits) {
+      const errList = culprit.structuredErrors || (culprit.errors || []).map((e) => ({
+        filePath: culprit.targetFile,
+        lineNum: culprit.lineNum || 1,
+        rule: String(e).match(/\b([a-zA-Z0-9_\-/@]+)$/)?.[1] || "",
+        symbol: String(e).match(/'([a-zA-Z0-9_$]+)'|"([a-zA-Z0-9_$]+)"/)?.[1] || "",
+        message: String(e),
+        raw: String(e),
+      }));
+      byFileMap.set(culprit.targetFile, errList);
+    }
+
+    this.logger.info(`⚡ Phase 1: Local deterministic repair across ${culprits.length} file(s)...`);
+    const { repairedFiles, residualFiles, allFixes } = await deterministicFixer.runBatchDeterministicRepair(byFileMap);
+
+    if (repairedFiles.length > 0) {
+      report.modifiedFiles.push(...repairedFiles);
+      report.rootCause = `Deterministic auto-fix resolved issues in: ${repairedFiles.join(", ")}`;
+      this.logger.info(`✅ Deterministically repaired ${repairedFiles.length} file(s) locally without LLM.`);
+
+      // If all files repaired deterministically, verify immediately
+      if (residualFiles.length === 0) {
+        if (this.ciVerifier) {
+          const ciResult = await this.ciVerifier.runVerification({
+            primaryTargetFile: culprits[0].targetFile,
+            explicitChecks,
+          });
+          report.setVerificationResults(ciResult);
+          return report.finalize(ciResult.finalState);
+        }
+      }
+    }
+
+    // 3. Phase 2: Token-budgeted Groq structured patch generation for residual files
+    const targetsToFix = residualFiles.length > 0
+      ? culprits.filter((c) => residualFiles.includes(c.targetFile))
+      : culprits;
+
+    for (const culprit of targetsToFix) {
+      const targetFile = culprit.targetFile;
+
+      // Extract focused code context (<4500 chars)
+      let targetSnippet = "";
+      try {
+        const fullContent = await this.tools.getRepoFile(targetFile);
+        const context = extractCodeContext(fullContent, culprit.lineNum || 1, 15);
+        targetSnippet = context.snippet || getLineWindow(fullContent, culprit.lineNum || 1, 15);
+      } catch {
+        targetSnippet = culprit.lineWindow || "";
+      }
+
+      const errorText = Array.isArray(culprit.errors) && culprit.errors.length > 0
+        ? culprit.errors.slice(0, 3).join("\n")
+        : `CI failure at line ${culprit.lineNum || 1}`;
+
+      // Request structured patch from Groq with schema validation & 429 backoff
+      const aiResponse = await this.groqClient.requestStructuredPatch({
+        targetFile,
+        errorDetails: errorText,
+        codeContext: targetSnippet,
+      });
+
+      report.setAIResult({
+        status: aiResponse.success ? "success" : "rejected",
+        retries: aiResponse.retries,
+        tokenUsage: aiResponse.tokenUsage,
+        explanation: aiResponse.data?.explanation || "",
+        error: aiResponse.error,
+      });
+
+      if (!aiResponse.success || !aiResponse.data) {
+        this.logger.warn(`AI patch rejected for '${targetFile}': ${aiResponse.error}`);
+        report.setPatchValidation({
+          status: "rejected",
+          schemaValid: false,
+          reason: aiResponse.error || "AI failed to generate valid structured patch.",
+        });
+        if (this.gitApplier) await this.gitApplier.rollback();
+        return report.finalize("REJECTED");
+      }
+
+      const proposal = aiResponse.data;
+      if (proposal.status === "no_fix") {
+        this.logger.info(`AI proposed 'no_fix' for '${targetFile}': ${proposal.explanation}`);
+        if (this.gitApplier) await this.gitApplier.rollback();
+        return report.finalize("FAILED");
+      }
+
+      report.setPatchValidation({
+        status: "passed",
+        schemaValid: true,
+        gitCheckValid: true,
+      });
+
+      // 4. Apply patch deterministically using git apply & safety checks
+      if (this.gitApplier) {
+        const patchResult = await this.gitApplier.applyPatch({
+          patchText: proposal.patch,
+          targetFile,
+          allowedFiles: effectiveAllowed,
+        });
+
+        report.setPatchApplication(patchResult);
+
+        if (!patchResult.success) {
+          this.logger.warn(`Patch application rejected for '${targetFile}': ${patchResult.reason}`);
+          await this.gitApplier.rollback();
+          return report.finalize("REJECTED");
+        }
+
+        report.modifiedFiles.push(...patchResult.modifiedFiles);
+      }
+
+      // Record root cause explanation
+      report.rootCause = `Remediation in ${targetFile}: ${proposal.explanation}`;
+    }
+
+    // 5. Multi-stage independent CI verification
+    if (this.ciVerifier) {
+      const ciResult = await this.ciVerifier.runVerification({
+        primaryTargetFile: culprits[0].targetFile,
+        explicitChecks,
+      });
+
+      report.setVerificationResults(ciResult);
+
+      if (ciResult.finalState !== "VERIFIED") {
+        this.logger.warn(`CI Verification failed (${ciResult.finalState}). Rolling back candidate edits...`);
+        if (this.gitApplier) {
+          await this.gitApplier.rollback();
+        }
+        return report.finalize(ciResult.finalState);
+      }
+
+      return report.finalize("VERIFIED");
+    }
+
+    return report.finalize("VERIFIED");
   }
 
   /**

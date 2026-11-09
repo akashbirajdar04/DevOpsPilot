@@ -29,6 +29,7 @@
     "groq-sdk": "^1.6.0",
     "probot": "^13.4.1",
     "smee-client": "^5.0.0",
-    "strip-ansi": "^7.1.0"
+    "strip-ansi": "^7.1.0",
+    "zod": "^4.6.7"
   }
 }
