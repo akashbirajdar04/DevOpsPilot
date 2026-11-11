@@ -224,6 +224,143 @@ test("Scenario 8: Valid unified diff applies cleanly via git apply and inspects 
 });
 
 // ---------------------------------------------------------------------------
+// Scenario 8b: Resilient patch normalization and application (miscalculated counts, missing context spaces)
+// ---------------------------------------------------------------------------
+test("Scenario 8b: Resilient patch application repairs files when LLM miscounts hunk lines and misses context spaces", async () => {
+  const code = [
+    'import React, { useState } from "react";',
+    "",
+    "export default function MessProfile() {",
+    '  const [name, setName] = useState("North Mess");',
+    "  const [error, setError] = useState(null);",
+    "",
+    "  return (",
+    '    <div className="profile">',
+    "      <h1>{name}</h1>",
+    "    </div>",
+    "  );",
+    "}",
+  ].join("\n");
+
+  const ws = await createGitWorkspace("frontend/src/components/mess/messprofile.jsx", code);
+  try {
+    const applier = new GitPatchApplier({ workspaceDir: ws.dir });
+    await applier.recordOriginalCommit();
+
+    // Simulates raw LLM output that would previously crash standard git apply:
+    // 1. Line count is completely off: @@ -4,99 +4,99 @@
+    // 2. Wrapped in ```diff markdown code fences
+    // 3. Conversational preamble & postscript
+    // 4. Context lines missing the leading space
+    const rawGroqPatch = `Here is the fix for messprofile.jsx:
+\`\`\`diff
+@@ -4,99 +4,99 @@
+  const [name, setName] = useState("North Mess");
+-  const [error, setError] = useState(null);
++  // Error state removed to fix unused warning
+
+  return (
+    <div className="profile">
+\`\`\`
+I hope this helps!`;
+
+    const result = await applier.applyPatch({
+      patchText: rawGroqPatch,
+      targetFile: "frontend/src/components/mess/messprofile.jsx",
+      allowedFiles: ["frontend/src/components/mess/messprofile.jsx"],
+    });
+
+    assert.equal(result.success, true);
+    assert.deepEqual(result.modifiedFiles, ["frontend/src/components/mess/messprofile.jsx"]);
+
+    const updated = await fs.readFile(ws.filePath, "utf-8");
+    assert.equal(updated.includes("// Error state removed to fix unused warning"), true);
+    assert.equal(updated.includes("const [error, setError]"), false);
+  } finally {
+    await ws.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Scenario 8c: Semantic hunk fallback applies cleanly when Git CLI fails on skipped context
+// ---------------------------------------------------------------------------
+test("Scenario 8c: Semantic hunk fallback applies patch when Git CLI fails due to omitted context blank lines", async () => {
+  const code = [
+    'import React, { useState } from "react";',
+    "",
+    "export default function MessProfile() {",
+    '  const [name, setName] = useState("North Mess");',
+    "  const [error, setError] = useState(null);",
+    "", // Blank line that LLM skips in its patch context
+    "  return (",
+    '    <div className="profile">',
+    "      <h1>{name}</h1>",
+    "    </div>",
+    "  );",
+    "}",
+  ].join("\n");
+
+  const ws = await createGitWorkspace("frontend/src/components/mess/messprofile.jsx", code);
+  try {
+    const applier = new GitPatchApplier({ workspaceDir: ws.dir });
+    await applier.recordOriginalCommit();
+
+    // Patch omitting the blank line between setError and return
+    const patchWithSkippedBlank = `@@ -4,4 +4,4 @@
+   const [name, setName] = useState("North Mess");
+-  const [error, setError] = useState(null);
++  // Removed unused error state
+   return (
+     <div className="profile">`;
+
+    const result = await applier.applyPatch({
+      patchText: patchWithSkippedBlank,
+      targetFile: "frontend/src/components/mess/messprofile.jsx",
+      allowedFiles: ["frontend/src/components/mess/messprofile.jsx"],
+    });
+
+    assert.equal(result.success, true);
+    assert.deepEqual(result.modifiedFiles, ["frontend/src/components/mess/messprofile.jsx"]);
+
+    const updated = await fs.readFile(ws.filePath, "utf-8");
+    assert.equal(updated.includes("// Removed unused error state"), true);
+    assert.equal(updated.includes("const [error, setError]"), false);
+  } finally {
+    await ws.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Scenario 8d: Patch introducing AST syntax error is rejected and rolled back
+// ---------------------------------------------------------------------------
+test("Scenario 8d: Patch introducing AST syntax error is rejected and rolled back cleanly", async () => {
+  const code = 'export function App() {\n  return <div>Hello</div>;\n}\n';
+  const ws = await createGitWorkspace("src/App.jsx", code);
+  try {
+    const applier = new GitPatchApplier({ workspaceDir: ws.dir });
+    await applier.recordOriginalCommit();
+
+    // Patch introduces unclosed JSX tag
+    const brokenPatch = '@@ -1,3 +1,3 @@\n export function App() {\n-  return <div>Hello</div>;\n+  return <div>Hello;\n }\n';
+
+    const result = await applier.applyPatch({
+      patchText: brokenPatch,
+      targetFile: "src/App.jsx",
+      allowedFiles: ["src/App.jsx"],
+    });
+
+    assert.equal(result.success, false);
+    assert.match(result.reason, /invalid syntax/i);
+
+    // Ensure workspace is rolled back to original commit
+    const current = await fs.readFile(ws.filePath, "utf-8");
+    assert.equal(current.replace(/\r\n/g, "\n"), code.replace(/\r\n/g, "\n"));
+  } finally {
+    await ws.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Scenario 9: ESLint failure
 // ---------------------------------------------------------------------------
 test("Scenario 9: ESLint failure isolates errors and classifies outcome as FAILED", async () => {

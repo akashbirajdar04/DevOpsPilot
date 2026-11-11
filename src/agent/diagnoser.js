@@ -16,7 +16,7 @@ import { SRE_SYSTEM_PROMPT, buildRemediationUserPrompt } from "./prompts.js";
 import { DeterministicFixer } from "../services/deterministicFixer.js";
 import { validatePatchOutput, validateModifiedFile } from "./validator.js";
 import { GroqRemediationClient } from "./groqClient.js";
-import { GitPatchApplier } from "./gitPatchApplier.js";
+import { GitPatchApplier, applyUnifiedDiff } from "./gitPatchApplier.js";
 import { CIVerifier } from "../services/ciVerifier.js";
 import { RemediationReport } from "../services/remediationReport.js";
 import { parseAndValidatePatchResponse } from "./patchSchema.js";
@@ -121,75 +121,7 @@ export function isTruncatedCode(code) {
   return /(\/\/|\/\*)\s*(\[?.*(?:remaining lines|rest of code|code omitted|token limits))/i.test(code);
 }
 
-/**
- * Surgically apply unified diff hunks (@@ -start,len +start,len @@) to file content.
- * @param {string} fullContent
- * @param {string} diffText
- * @returns {string|null}
- */
-export function applyUnifiedDiff(fullContent, diffText) {
-  if (!fullContent || !diffText) return null;
-  const isCrlf = fullContent.includes("\r\n");
-  const normalizedContent = fullContent.replace(/\r\n/g, "\n");
-  const normalizedDiff = diffText.replace(/\r\n/g, "\n");
-
-  const hunkRegex = /@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@[^\n]*\n([\s\S]*?)(?=(?:\n@@ -\d+|$))/g;
-  let updated = normalizedContent;
-  let matches = 0;
-  let m;
-
-  while ((m = hunkRegex.exec(normalizedDiff)) !== null) {
-    const hunkBody = m[3];
-    const hunkLines = hunkBody.split("\n");
-    const searchLines = [];
-    const replaceLines = [];
-
-    for (const line of hunkLines) {
-      if (line.startsWith("-")) {
-        searchLines.push(line.slice(1));
-      } else if (line.startsWith("+")) {
-        replaceLines.push(line.slice(1));
-      } else if (line.startsWith(" ")) {
-        searchLines.push(line.slice(1));
-        replaceLines.push(line.slice(1));
-      } else if (line === "") {
-        searchLines.push("");
-        replaceLines.push("");
-      }
-    }
-
-    if (searchLines.length === 0) continue;
-
-    const searchStr = searchLines.join("\n");
-    const replaceStr = replaceLines.join("\n");
-
-    if (updated.includes(searchStr)) {
-      updated = updated.replace(searchStr, replaceStr);
-      matches++;
-    } else {
-      // Fuzzy line match ignoring leading/trailing whitespace
-      const contentLines = updated.split("\n");
-      let foundIdx = -1;
-      for (let i = 0; i <= contentLines.length - searchLines.length; i++) {
-        const slice = contentLines.slice(i, i + searchLines.length).map((l) => l.trim());
-        if (slice.every((line, idx) => line === searchLines[idx].trim())) {
-          foundIdx = i;
-          break;
-        }
-      }
-      if (foundIdx !== -1) {
-        contentLines.splice(foundIdx, searchLines.length, replaceStr);
-        updated = contentLines.join("\n");
-        matches++;
-      }
-    }
-  }
-
-  if (matches > 0) {
-    return isCrlf ? updated.replace(/\n/g, "\r\n") : updated;
-  }
-  return null;
-}
+export { applyUnifiedDiff };
 
 /**
  * Parse SEARCH/REPLACE blocks using a strict state machine rather than greedy regular expressions.
