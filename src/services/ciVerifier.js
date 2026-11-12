@@ -264,6 +264,8 @@ export class CIVerifier {
         if (!lintPassed) {
           hasFailure = true;
           failureReasons.push(`Lint check failed with ${errorCount} error(s) (exit code ${execResult.exitCode})`);
+          const diagLines = (execResult.stderr || execResult.stdout || "").trim().split("\n").slice(-25).join("\n");
+          this.logger.error?.(`[CI Verification] Lint FAILED (exit code ${execResult.exitCode}):\n${diagLines}`);
         }
       }
     }
@@ -324,6 +326,8 @@ export class CIVerifier {
         if (!passed) {
           hasFailure = true;
           failureReasons.push(`Build check failed (exit code ${buildResult.exitCode})`);
+          const diagLines = (buildResult.stderr || buildResult.stdout || "").trim().split("\n").slice(-25).join("\n");
+          this.logger.error?.(`[CI Verification] Build FAILED (exit code ${buildResult.exitCode}):\n${diagLines}`);
         }
       }
     }

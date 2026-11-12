@@ -241,7 +241,7 @@ export default function healOpsApp(app, optionsOrBootTime) {
       // -----------------------------------------------------------------------
       if (report.finalState !== "VERIFIED") {
         app.log.warn(
-          `Remediation completed with state '${report.finalState}' for Run #${runId}. Exiting cleanly without opening a PR.`
+          `Remediation completed with state '${report.finalState}' for Run #${runId} (${report.verification?.summary || report.failureReason || "verification unverified"}). Exiting cleanly without opening a PR.`
         );
         return;
       }

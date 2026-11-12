@@ -841,7 +841,7 @@ export class DiagnoserAgent {
       report.setVerificationResults(ciResult);
 
       if (ciResult.finalState !== "VERIFIED") {
-        this.logger.warn(`CI Verification failed (${ciResult.finalState}). Rolling back candidate edits...`);
+        this.logger.warn(`CI Verification failed (${ciResult.finalState}): ${ciResult.summary || ciResult.failureReason || ""}. Rolling back candidate edits...`);
         if (this.gitApplier) {
           await this.gitApplier.rollback();
         }
