@@ -95,12 +95,13 @@ export class RemediationReport {
     }
   }
 
-  setVerificationResults({ finalState, results = {}, failureReason = null }) {
+  setVerificationResults({ finalState, results = {}, failureReason = null, summary = null }) {
     this.verification = results;
+    this.verificationSummary = summary;
     this.finalState = finalState;
     if (finalState !== "VERIFIED") {
       this.failureStage = "ci_verification";
-      this.failureReason = failureReason;
+      this.failureReason = failureReason || summary;
     }
   }
 

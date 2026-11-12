@@ -66,9 +66,13 @@ export function isValidUnifiedDiff(patch) {
   const hasHunk = /@@\s*-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s*@@/.test(trimmed);
   // Or at least --- and +++ lines and diff changes
   const hasHeaders = trimmed.includes("--- ") && trimmed.includes("+++ ");
+  // Or SEARCH/REPLACE markers
+  const hasSearchReplace = trimmed.includes("<<<<<<< SEARCH") && trimmed.includes(">>>>>>> REPLACE");
 
-  return hasHunk || hasHeaders;
+  return hasHunk || hasHeaders || hasSearchReplace;
 }
+
+export const isValidPatchFormat = isValidUnifiedDiff;
 
 /**
  * Safely parse and validate an AI remediation response according to strict schema rules.

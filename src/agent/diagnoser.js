@@ -10,13 +10,20 @@ import {
   extractCodeContext,
   diagnoseLogErrors,
   extractVerificationDiagnostics,
+  extractCulpritLocation,
 } from "../services/logParser.js";
 import { sleep } from "../config.js";
 import { SRE_SYSTEM_PROMPT, buildRemediationUserPrompt } from "./prompts.js";
 import { DeterministicFixer } from "../services/deterministicFixer.js";
 import { validatePatchOutput, validateModifiedFile } from "./validator.js";
 import { GroqRemediationClient } from "./groqClient.js";
-import { GitPatchApplier, applyUnifiedDiff } from "./gitPatchApplier.js";
+import {
+  GitPatchApplier,
+  applyUnifiedDiff,
+  parseSearchReplaceBlocks,
+  findMatchInContent,
+  applySearchReplaceDetailed,
+} from "./gitPatchApplier.js";
 import { CIVerifier } from "../services/ciVerifier.js";
 import { RemediationReport } from "../services/remediationReport.js";
 import { parseAndValidatePatchResponse } from "./patchSchema.js";
@@ -31,6 +38,10 @@ export {
   CIVerifier,
   RemediationReport,
   parseAndValidatePatchResponse,
+  applyUnifiedDiff,
+  parseSearchReplaceBlocks,
+  findMatchInContent,
+  applySearchReplaceDetailed,
 };
 
 /**
@@ -119,321 +130,6 @@ export function cleanRawCodeOutput(rawContent) {
 export function isTruncatedCode(code) {
   if (!code) return false;
   return /(\/\/|\/\*)\s*(\[?.*(?:remaining lines|rest of code|code omitted|token limits))/i.test(code);
-}
-
-export { applyUnifiedDiff };
-
-/**
- * Parse SEARCH/REPLACE blocks using a strict state machine rather than greedy regular expressions.
- * Accurately extracts multiple blocks, deletions (empty replacement), and rejects unclosed or malformed blocks.
- *
- * @param {string} patchText
- * @returns {{ success: boolean, blocks?: Array<{ search: string, replace: string, startLine: number }>, reason?: string }}
- */
-export function parseSearchReplaceBlocks(patchText) {
-  if (!patchText || typeof patchText !== "string") {
-    return { success: false, reason: "Empty patch received." };
-  }
-
-  const lines = patchText.replace(/\r\n/g, "\n").split("\n");
-  const blocks = [];
-  let state = "IDLE"; // "IDLE" | "IN_SEARCH" | "IN_REPLACE"
-  let currentSearch = [];
-  let currentReplace = [];
-  let blockStartLine = -1;
-
-  for (let i = 0; i < lines.length; i++) {
-    const rawLine = lines[i];
-    const trimmed = rawLine.trim();
-
-    if (trimmed.startsWith("<<<<<<< SEARCH")) {
-      if (state !== "IDLE") {
-        return {
-          success: false,
-          reason: `Malformed SEARCH_REPLACE at line ${i + 1}: unexpected <<<<<<< SEARCH marker before completing previous block.`,
-        };
-      }
-      state = "IN_SEARCH";
-      currentSearch = [];
-      currentReplace = [];
-      blockStartLine = i + 1;
-    } else if (trimmed.startsWith("=======")) {
-      if (state !== "IN_SEARCH") {
-        return {
-          success: false,
-          reason: `Malformed SEARCH_REPLACE at line ${i + 1}: unexpected ======= marker outside of search block.`,
-        };
-      }
-      state = "IN_REPLACE";
-    } else if (trimmed.startsWith(">>>>>>> REPLACE")) {
-      if (state !== "IN_REPLACE") {
-        return {
-          success: false,
-          reason: `Malformed SEARCH_REPLACE at line ${i + 1}: unexpected >>>>>>> REPLACE marker before ======= divider.`,
-        };
-      }
-      const searchStr = currentSearch.join("\n");
-      const replaceStr = currentReplace.join("\n");
-
-      if (searchStr.length === 0 && searchStr.trim() === "") {
-        return {
-          success: false,
-          reason: `Malformed SEARCH_REPLACE starting at line ${blockStartLine}: SEARCH block cannot be empty.`,
-        };
-      }
-
-      blocks.push({
-        search: searchStr,
-        replace: replaceStr,
-        startLine: blockStartLine,
-      });
-      state = "IDLE";
-    } else {
-      if (state === "IN_SEARCH") {
-        currentSearch.push(rawLine);
-      } else if (state === "IN_REPLACE") {
-        currentReplace.push(rawLine);
-      }
-    }
-  }
-
-  if (state !== "IDLE") {
-    return {
-      success: false,
-      reason: `Malformed SEARCH_REPLACE starting at line ${blockStartLine}: block is incomplete (missing closing marker).`,
-    };
-  }
-
-  if (blocks.length === 0) {
-    return {
-      success: false,
-      reason: "No valid SEARCH_REPLACE blocks found in patch.",
-    };
-  }
-
-  return {
-    success: true,
-    blocks,
-  };
-}
-
-/**
- * Locate a search snippet uniquely within file content.
- * Enforces strict single-match semantics: rejects non-matching code and ambiguous multiple matches.
- *
- * @param {string} content
- * @param {string} rawSearch
- * @param {string} rawReplace
- * @returns {{ found: boolean, start?: number, end?: number, replace?: string, reason?: string }}
- */
-function findMatchInContent(content, rawSearch, rawReplace) {
-  if (!rawSearch || rawSearch.length === 0) {
-    return { found: false, reason: "Search block is empty." };
-  }
-
-  // 1. Exact match
-  // 1a. If deletion (rawReplace === ""), prefer exact line deletion with trailing newline
-  if (rawReplace === "" && content.includes(rawSearch + "\n")) {
-    const firstIdx = content.indexOf(rawSearch + "\n");
-    const secondIdx = content.indexOf(rawSearch + "\n", firstIdx + 1);
-    if (secondIdx !== -1) {
-      return { found: false, reason: "Ambiguous match (search block matches multiple locations in file)." };
-    }
-    return { found: true, start: firstIdx, end: firstIdx + rawSearch.length + 1, replace: "" };
-  }
-
-  // 1b. Exact substring match
-  if (content.includes(rawSearch)) {
-    const firstIdx = content.indexOf(rawSearch);
-    const secondIdx = content.indexOf(rawSearch, firstIdx + 1);
-    if (secondIdx !== -1) {
-      return { found: false, reason: "Ambiguous match (search block matches multiple locations in file)." };
-    }
-    return { found: true, start: firstIdx, end: firstIdx + rawSearch.length, replace: rawReplace };
-  }
-
-  // 2. Line numbers stripped match
-  const strippedSearch = rawSearch.replace(/^\s*\d+[:|]?\s*/gm, "");
-  const strippedReplace = rawReplace.replace(/^\s*\d+[:|]?\s*/gm, "");
-
-  if (strippedSearch !== rawSearch) {
-    if (strippedReplace === "" && content.includes(strippedSearch + "\n")) {
-      const firstIdx = content.indexOf(strippedSearch + "\n");
-      const secondIdx = content.indexOf(strippedSearch + "\n", firstIdx + 1);
-      if (secondIdx !== -1) {
-        return { found: false, reason: "Ambiguous match after stripping line numbers." };
-      }
-      return { found: true, start: firstIdx, end: firstIdx + strippedSearch.length + 1, replace: "" };
-    }
-
-    if (content.includes(strippedSearch)) {
-      const firstIdx = content.indexOf(strippedSearch);
-      const secondIdx = content.indexOf(strippedSearch, firstIdx + 1);
-      if (secondIdx !== -1) {
-        return { found: false, reason: "Ambiguous match after stripping line numbers." };
-      }
-      return { found: true, start: firstIdx, end: firstIdx + strippedSearch.length, replace: strippedReplace };
-    }
-  }
-
-  // 3. Trimmed exact match (only if search is non-trivial and unique)
-  const trimmedSearch = (strippedSearch || rawSearch).trim();
-  const trimmedReplace = (strippedReplace || rawReplace).trim();
-  if (trimmedSearch.length > 0 && content.includes(trimmedSearch)) {
-    const firstIdx = content.indexOf(trimmedSearch);
-    const secondIdx = content.indexOf(trimmedSearch, firstIdx + 1);
-    if (secondIdx !== -1) {
-      return { found: false, reason: "Ambiguous match (trimmed search matches multiple locations in file)." };
-    }
-    return { found: true, start: firstIdx, end: firstIdx + trimmedSearch.length, replace: trimmedReplace };
-  }
-
-  // 4. Line-by-line whitespace-flexible match
-  const searchLines = (strippedSearch || rawSearch).split("\n");
-  const contentLines = content.split("\n");
-
-  if (searchLines.length > 0 && searchLines.length <= contentLines.length) {
-    const matchingIndices = [];
-    for (let i = 0; i <= contentLines.length - searchLines.length; i++) {
-      let isMatch = true;
-      for (let j = 0; j < searchLines.length; j++) {
-        if (contentLines[i + j].trim() !== searchLines[j].trim()) {
-          isMatch = false;
-          break;
-        }
-      }
-      if (isMatch) {
-        matchingIndices.push(i);
-      }
-    }
-
-    if (matchingIndices.length > 1) {
-      return { found: false, reason: "Ambiguous match (fuzzy line search matched multiple locations in file)." };
-    }
-
-    if (matchingIndices.length === 1) {
-      const foundIdx = matchingIndices[0];
-      let charStart = 0;
-      for (let i = 0; i < foundIdx; i++) {
-        charStart += contentLines[i].length + 1;
-      }
-
-      let charEnd = charStart;
-      for (let i = 0; i < searchLines.length; i++) {
-        charEnd += contentLines[foundIdx + i].length;
-        if (foundIdx + i < contentLines.length - 1) {
-          charEnd += 1;
-        }
-      }
-
-      const baseIndent = contentLines[foundIdx].match(/^\s*/)?.[0] || "";
-      const replaceLines = (strippedReplace || rawReplace).split("\n");
-      const indentedReplace = replaceLines
-        .map((l) => (l.trim() ? baseIndent + l.trimStart() : ""))
-        .join("\n");
-
-      return {
-        found: true,
-        start: charStart,
-        end: charEnd,
-        replace: strippedReplace === "" ? "" : indentedReplace,
-      };
-    }
-  }
-
-  return { found: false, reason: "Search text does not match target file." };
-}
-
-/**
- * Surgically apply SEARCH/REPLACE blocks or unified diff to file content with detailed reporting.
- * - Parses multiple blocks independently
- * - Validates that every search block uniquely matches before modifying
- * - Validates that replacement blocks do not overlap
- * - Applies all blocks atomically from bottom to top
- * - Returns structured error reason if matching or validation fails
- *
- * @param {string} fullContent
- * @param {string} patchText
- * @returns {{ success: boolean, code: string|null, reason: string|null, blocksCount: number }}
- */
-export function applySearchReplaceDetailed(fullContent, patchText) {
-  if (!fullContent || typeof fullContent !== "string") {
-    return { success: false, code: null, reason: "Original file content is empty.", blocksCount: 0 };
-  }
-  if (!patchText || typeof patchText !== "string") {
-    return { success: false, code: null, reason: "Patch text is empty.", blocksCount: 0 };
-  }
-
-  const isCrlf = fullContent.includes("\r\n");
-  const normalizedContent = fullContent.replace(/\r\n/g, "\n");
-  const normalizedPatch = patchText.replace(/\r\n/g, "\n");
-
-  const parsed = parseSearchReplaceBlocks(normalizedPatch);
-  if (!parsed.success) {
-    // Fallback to unified diff parser if SEARCH/REPLACE parsing failed but unified markers exist
-    if (normalizedPatch.includes("@@ -") || normalizedPatch.includes("--- a/")) {
-      const unifiedResult = applyUnifiedDiff(normalizedContent, normalizedPatch);
-      if (unifiedResult) {
-        return {
-          success: true,
-          code: isCrlf ? unifiedResult.replace(/\n/g, "\r\n") : unifiedResult,
-          reason: null,
-          blocksCount: 1,
-        };
-      }
-      return { success: false, code: null, reason: "Malformed unified diff could not be applied.", blocksCount: 0 };
-    }
-    return { success: false, code: null, reason: parsed.reason, blocksCount: 0 };
-  }
-
-  const matches = [];
-  for (let b = 0; b < parsed.blocks.length; b++) {
-    const block = parsed.blocks[b];
-    const matchResult = findMatchInContent(normalizedContent, block.search, block.replace);
-    if (!matchResult.found) {
-      return {
-        success: false,
-        code: null,
-        reason: `Block ${b + 1}: ${matchResult.reason}`,
-        blocksCount: parsed.blocks.length,
-      };
-    }
-
-    matches.push({
-      start: matchResult.start,
-      end: matchResult.end,
-      replace: matchResult.replace,
-      blockNum: b + 1,
-    });
-  }
-
-  // Check for overlapping matches
-  matches.sort((a, b) => a.start - b.start);
-  for (let i = 0; i < matches.length - 1; i++) {
-    if (matches[i].end > matches[i + 1].start) {
-      return {
-        success: false,
-        code: null,
-        reason: `Overlapping blocks detected: Block ${matches[i].blockNum} and Block ${matches[i + 1].blockNum}.`,
-        blocksCount: parsed.blocks.length,
-      };
-    }
-  }
-
-  // Apply atomically in reverse order (bottom to top)
-  matches.sort((a, b) => b.start - a.start);
-  let updated = normalizedContent;
-  for (const m of matches) {
-    updated = updated.slice(0, m.start) + m.replace + updated.slice(m.end);
-  }
-
-  const finalCode = isCrlf ? updated.replace(/\n/g, "\r\n") : updated;
-  return {
-    success: true,
-    code: finalCode,
-    reason: null,
-    blocksCount: parsed.blocks.length,
-  };
 }
 
 /**
@@ -733,24 +429,12 @@ export class DiagnoserAgent {
       report.modifiedFiles.push(...repairedFiles);
       report.rootCause = `Deterministic auto-fix resolved issues in: ${repairedFiles.join(", ")}`;
       this.logger.info(`✅ Deterministically repaired ${repairedFiles.length} file(s) locally without LLM.`);
-
-      // If all files repaired deterministically, verify immediately
-      if (residualFiles.length === 0) {
-        if (this.ciVerifier) {
-          const ciResult = await this.ciVerifier.runVerification({
-            primaryTargetFile: culprits[0].targetFile,
-            explicitChecks,
-          });
-          report.setVerificationResults(ciResult);
-          return report.finalize(ciResult.finalState);
-        }
-      }
     }
 
     // 3. Phase 2: Token-budgeted Groq structured patch generation for residual files
     const targetsToFix = residualFiles.length > 0
       ? culprits.filter((c) => residualFiles.includes(c.targetFile))
-      : culprits;
+      : (repairedFiles.length > 0 ? [] : culprits);
 
     for (const culprit of targetsToFix) {
       const targetFile = culprit.targetFile;
@@ -831,24 +515,92 @@ export class DiagnoserAgent {
       report.rootCause = `Remediation in ${targetFile}: ${proposal.explanation}`;
     }
 
-    // 5. Multi-stage independent CI verification
+    // 5. Multi-stage independent CI verification with iterative healing (Max 2 turns)
     if (this.ciVerifier) {
-      const ciResult = await this.ciVerifier.runVerification({
-        primaryTargetFile: culprits[0].targetFile,
-        explicitChecks,
-      });
+      const MAX_VERIFICATION_TURNS = 2;
+      let ciResult = null;
 
-      report.setVerificationResults(ciResult);
+      for (let turn = 1; turn <= MAX_VERIFICATION_TURNS; turn++) {
+        ciResult = await this.ciVerifier.runVerification({
+          primaryTargetFile: culprits[0].targetFile,
+          explicitChecks,
+        });
 
-      if (ciResult.finalState !== "VERIFIED") {
-        this.logger.warn(`CI Verification failed (${ciResult.finalState}): ${ciResult.summary || ciResult.failureReason || ""}. Rolling back candidate edits...`);
-        if (this.gitApplier) {
-          await this.gitApplier.rollback();
+        report.setVerificationResults(ciResult);
+
+        if (ciResult.finalState === "VERIFIED") {
+          return report.finalize("VERIFIED");
         }
-        return report.finalize(ciResult.finalState);
+
+        // If turn 1 failed, attempt targeted second-turn correction if Groq is available
+        if (turn < MAX_VERIFICATION_TURNS && this.groqClient) {
+          const checksMap = ciResult.results || ciResult.checks || {};
+          const failedStageEntry = Object.entries(checksMap).find(
+            ([_, check]) => check && (check.status === "failed" || check.status === "incomplete")
+          );
+          const stageName = failedStageEntry ? failedStageEntry[0] : "verification";
+          const stageOutput = failedStageEntry?.[1]?.output || ciResult.failureReason || "";
+
+          const diagLocation = extractCulpritLocation(stageOutput);
+          let turn2Target = diagLocation?.targetFile;
+
+          if (!turn2Target || !effectiveAllowed.some((a) => a === turn2Target || a.endsWith(turn2Target) || turn2Target.endsWith(a))) {
+            const candidateFiles = report.modifiedFiles.length > 0
+              ? report.modifiedFiles
+              : culprits.map((c) => c.targetFile);
+            turn2Target = candidateFiles.find((f) => stageOutput.includes(f)) || candidateFiles[0];
+          }
+
+          if (turn2Target) {
+            this.logger.info(
+              `🔄 Turn 1 verification failed in stage '${stageName}'. Engaging Turn 2 iterative correction for '${turn2Target}'...`
+            );
+
+            let turn2Context = "";
+            try {
+              const currentContent = await this.tools.getRepoFile(turn2Target);
+              const turn2Line = diagLocation?.lineNum || 1;
+              const context = extractCodeContext(currentContent, turn2Line, 20);
+              turn2Context = context.snippet || getLineWindow(currentContent, turn2Line, 20);
+            } catch {}
+
+            const turn2ErrorDetails = `Verification stage '${stageName}' failed with output:\n${stageOutput.slice(0, 2000)}`;
+
+            const turn2Response = await this.groqClient.requestStructuredPatch({
+              targetFile: turn2Target,
+              errorDetails: turn2ErrorDetails,
+              codeContext: turn2Context,
+            });
+
+            if (turn2Response.success && turn2Response.data && turn2Response.data.status === "fix_proposed") {
+              const turn2Proposal = turn2Response.data;
+              if (this.gitApplier) {
+                const turn2PatchResult = await this.gitApplier.applyPatch({
+                  patchText: turn2Proposal.patch,
+                  targetFile: turn2Target,
+                  allowedFiles: effectiveAllowed,
+                });
+
+                if (turn2PatchResult.success) {
+                  this.logger.info(`✅ Turn 2 delta patch applied cleanly to '${turn2Target}'. Re-running verification...`);
+                  report.modifiedFiles.push(...turn2PatchResult.modifiedFiles);
+                  continue;
+                } else {
+                  this.logger.warn(`Turn 2 patch application failed for '${turn2Target}': ${turn2PatchResult.reason}`);
+                }
+              }
+            } else {
+              this.logger.warn(`Turn 2 Groq correction failed or proposed no fix for '${turn2Target}': ${turn2Response.error || "no fix"}`);
+            }
+          }
+        }
       }
 
-      return report.finalize("VERIFIED");
+      this.logger.warn(`CI Verification failed (${ciResult?.finalState || "FAILED"}). Rolling back candidate edits...`);
+      if (this.gitApplier) {
+        await this.gitApplier.rollback();
+      }
+      return report.finalize(ciResult?.finalState || "FAILED");
     }
 
     return report.finalize("VERIFIED");

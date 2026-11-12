@@ -691,3 +691,160 @@ test("Scenario 18: Verification failure rolls back workspace to original commit 
     await ws.cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Scenario 19: GitPatchApplier natively applies SEARCH/REPLACE blocks
+// ---------------------------------------------------------------------------
+test("Scenario 19: GitPatchApplier natively applies SEARCH/REPLACE blocks and records diff", async () => {
+  const ws = await createGitWorkspace(
+    "src/calc.js",
+    "export function add(a, b) {\n  return a - b;\n}\n"
+  );
+  try {
+    const applier = new GitPatchApplier({ workspaceDir: ws.dir });
+    const patchText = `<<<<<<< SEARCH
+  return a - b;
+=======
+  return a + b;
+>>>>>>> REPLACE`;
+
+    const result = await applier.applyPatch({
+      patchText,
+      targetFile: "src/calc.js",
+      allowedFiles: ["src/calc.js"],
+    });
+
+    assert.equal(result.success, true);
+    assert.deepEqual(result.modifiedFiles, ["src/calc.js"]);
+    assert.ok(result.diff.includes("+  return a + b;"));
+
+    const modifiedContent = await fs.readFile(ws.filePath, "utf-8");
+    assert.equal(
+      modifiedContent.replace(/\r\n/g, "\n"),
+      "export function add(a, b) {\n  return a + b;\n}\n"
+    );
+  } finally {
+    await ws.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Scenario 20: 2-Turn Iterative Healing Loop succeeds when Turn 1 fails
+// ---------------------------------------------------------------------------
+test("Scenario 20: 2-Turn Iterative Healing Loop recovers from Turn 1 compiler error and produces VERIFIED report", async () => {
+  const ws = await createGitWorkspace(
+    "src/app.js",
+    "export function compute() {\n  const x = 10;\n  return x;\n}\n"
+  );
+  try {
+    const sandbox = new Sandbox(ws.dir);
+    const tools = new AgentTools({ workspaceDir: ws.dir, sandbox });
+
+    const agent = new DiagnoserAgent({
+      tools,
+      apiKey: "mock-key",
+      model: "openai/gpt-oss-120b",
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+
+    let groqTurn = 0;
+    agent.groqClient.requestStructuredPatch = async ({ targetFile, errorDetails }) => {
+      groqTurn++;
+      if (groqTurn === 1) {
+        // Turn 1: AI introduces a typo that will fail verification
+        return {
+          success: true,
+          data: {
+            status: "fix_proposed",
+            file: "src/app.js",
+            fix_type: "logic_error",
+            patch: `<<<<<<< SEARCH
+  return x;
+=======
+  return x + typoVar;
+>>>>>>> REPLACE`,
+            explanation: "Candidate fix with typo",
+          },
+          tokenUsage: { promptTokens: 100, completionTokens: 40, totalTokens: 140 },
+          retries: 0,
+        };
+      } else {
+        // Turn 2: AI receives compiler feedback and fixes the typo cleanly
+        assert.ok(errorDetails.includes("typoVar is not defined"));
+        return {
+          success: true,
+          data: {
+            status: "fix_proposed",
+            file: "src/app.js",
+            fix_type: "logic_error",
+            patch: `<<<<<<< SEARCH
+  return x + typoVar;
+=======
+  return x + 5;
+>>>>>>> REPLACE`,
+            explanation: "Corrected candidate fix",
+          },
+          tokenUsage: { promptTokens: 120, completionTokens: 40, totalTokens: 160 },
+          retries: 0,
+        };
+      }
+    };
+
+    const report = await agent.runDeterministicRemediationPipeline({
+      culprits: [{ targetFile: "src/app.js", lineNum: 3, errors: ["initial failure"] }],
+      repo: "owner/repo",
+      runId: 9999,
+      runAttempt: 1,
+      explicitChecks: {
+        lint: {
+          command: 'node -e "const fs = require(\'fs\'); const code = fs.readFileSync(\'src/app.js\', \'utf8\'); if (code.includes(\'typoVar\')) { console.error(\'src/app.js:3 error: typoVar is not defined\'); process.exit(1); } else { process.exit(0); }"',
+          cwd: ws.dir,
+        },
+      },
+    });
+
+    assert.equal(groqTurn, 2);
+    assert.equal(report.finalState, "VERIFIED");
+
+    const finalContent = await fs.readFile(ws.filePath, "utf-8");
+    assert.equal(
+      finalContent.replace(/\r\n/g, "\n"),
+      "export function compute() {\n  const x = 10;\n  return x + 5;\n}\n"
+    );
+  } finally {
+    await ws.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Scenario 21: ESLint warning isolation with --quiet decouples warnings from fatal errors
+// ---------------------------------------------------------------------------
+test("Scenario 21: ESLint warning isolation verifies cleanly when 0 fatal errors exist despite warnings", async () => {
+  const ws = await createGitWorkspace(
+    "src/app.jsx",
+    "export function App() { return <div>Hello</div>; }\n"
+  );
+  try {
+    const verifier = new CIVerifier({
+      workspaceDir: ws.dir,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+
+    const result = await verifier.runVerification({
+      primaryTargetFile: "src/app.jsx",
+      explicitChecks: {
+        lint: {
+          command: 'node -e "console.log(JSON.stringify([{ filePath: \'src/app.jsx\', errorCount: 0, warningCount: 20, messages: [{ ruleId: \'react-hooks/exhaustive-deps\', severity: 1, message: \'Missing dependency\' }] }])); process.exit(1);"',
+          cwd: ws.dir,
+        },
+      },
+    });
+
+    assert.equal(result.results.lint.status, "passed");
+    assert.equal(result.results.lint.errors, 0);
+    assert.equal(result.results.lint.warnings, 20);
+    assert.equal(result.finalState, "VERIFIED");
+  } finally {
+    await ws.cleanup();
+  }
+});

@@ -212,18 +212,23 @@ export class CIVerifier {
       const lintConfig = checksToRun.lint;
       this.logger.info?.(`[CI Verification] Executing Lint: '${lintConfig.command}'...`);
 
-      // Attempt to execute with --format json to derive errors and warnings from the exact same execution
-      const jsonCmd = `${lintConfig.command} -- --format json`;
+      // Attempt to execute with --format json and --quiet to isolate fatal errors from non-fatal warnings
+      const jsonCmd = `${lintConfig.command} -- --format json --quiet`;
       let execResult = await runCommandSafe(jsonCmd, lintConfig.cwd || this.workspaceDir, this.timeout);
 
       let parsedJson = null;
+      let isStructuredJson = false;
       if (!execResult.timedOut) {
         parsedJson = parseESLintJson(execResult.stdout);
+        if (parsedJson) {
+          isStructuredJson = true;
+        }
       }
 
-      // If json flag was rejected or not supported by custom script, run standard command
+      // If json flag was rejected or not supported by custom script, run with --quiet flag
       if (!parsedJson && !execResult.timedOut) {
-        execResult = await runCommandSafe(lintConfig.command, lintConfig.cwd || this.workspaceDir, this.timeout);
+        const quietCmd = `${lintConfig.command} -- --quiet`;
+        execResult = await runCommandSafe(quietCmd, lintConfig.cwd || this.workspaceDir, this.timeout);
         const diag = extractVerificationDiagnostics(
           (execResult.stdout + "\n" + execResult.stderr).trim(),
           execResult.exitCode
@@ -231,7 +236,7 @@ export class CIVerifier {
         parsedJson = {
           fatalErrors: diag.fatalErrors,
           warnings: diag.warnings,
-          errorCount: diag.errorCount,
+          errorCount: execResult.exitCode === 0 ? 0 : Math.max(diag.errorCount, 1),
           warningCount: diag.warningCount,
         };
       }
@@ -244,13 +249,15 @@ export class CIVerifier {
           warnings: 0,
           exitCode: 124,
           command: lintConfig.command,
+          output: (execResult.stderr + "\n" + execResult.stdout).trim(),
           durationMs: execResult.durationMs,
         };
         failureReasons.push(`Lint check timed out after ${this.timeout}ms`);
       } else {
         const errorCount = parsedJson?.errorCount ?? (execResult.exitCode === 0 ? 0 : 1);
         const warningCount = parsedJson?.warningCount ?? 0;
-        const lintPassed = execResult.exitCode === 0 && errorCount === 0;
+        // If structured ESLint JSON parsed, success is strictly 0 fatal errors; otherwise require exitCode 0
+        const lintPassed = isStructuredJson ? errorCount === 0 : (execResult.exitCode === 0 && errorCount === 0);
 
         results.lint = {
           status: lintPassed ? "passed" : "failed",
@@ -258,6 +265,7 @@ export class CIVerifier {
           warnings: warningCount,
           exitCode: execResult.exitCode,
           command: lintConfig.command,
+          output: (execResult.stderr + "\n" + execResult.stdout).trim(),
           durationMs: execResult.durationMs,
         };
 
@@ -291,11 +299,14 @@ export class CIVerifier {
           status: passed ? "passed" : "failed",
           exitCode: tcResult.exitCode,
           command: tcConfig.command,
+          output: (tcResult.stderr + "\n" + tcResult.stdout).trim(),
           durationMs: tcResult.durationMs,
         };
         if (!passed) {
           hasFailure = true;
           failureReasons.push(`TypeScript check failed (exit code ${tcResult.exitCode})`);
+          const diagLines = (tcResult.stderr || tcResult.stdout || "").trim().split("\n").slice(-25).join("\n");
+          this.logger.error?.(`[CI Verification] TypeScript FAILED (exit code ${tcResult.exitCode}):\n${diagLines}`);
         }
       }
     }
@@ -312,6 +323,7 @@ export class CIVerifier {
           status: "incomplete",
           exitCode: 124,
           command: buildConfig.command,
+          output: (buildResult.stderr + "\n" + buildResult.stdout).trim(),
           durationMs: buildResult.durationMs,
         };
         failureReasons.push(`Build check timed out after ${this.timeout}ms`);
@@ -321,6 +333,7 @@ export class CIVerifier {
           status: passed ? "passed" : "failed",
           exitCode: buildResult.exitCode,
           command: buildConfig.command,
+          output: (buildResult.stderr + "\n" + buildResult.stdout).trim(),
           durationMs: buildResult.durationMs,
         };
         if (!passed) {
@@ -344,6 +357,7 @@ export class CIVerifier {
           status: "incomplete",
           exitCode: 124,
           command: testConfig.command,
+          output: (testResult.stderr + "\n" + testResult.stdout).trim(),
           durationMs: testResult.durationMs,
         };
         failureReasons.push(`Tests check timed out after ${this.timeout}ms`);
@@ -353,11 +367,14 @@ export class CIVerifier {
           status: passed ? "passed" : "failed",
           exitCode: testResult.exitCode,
           command: testConfig.command,
+          output: (testResult.stderr + "\n" + testResult.stdout).trim(),
           durationMs: testResult.durationMs,
         };
         if (!passed) {
           hasFailure = true;
           failureReasons.push(`Tests failed (exit code ${testResult.exitCode})`);
+          const diagLines = (testResult.stderr || testResult.stdout || "").trim().split("\n").slice(-25).join("\n");
+          this.logger.error?.(`[CI Verification] Tests FAILED (exit code ${testResult.exitCode}):\n${diagLines}`);
         }
       }
     }
