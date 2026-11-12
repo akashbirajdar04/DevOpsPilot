@@ -116,6 +116,8 @@ export function cleanRepoFilePath(rawPath, repoName = "") {
   clean = clean.replace(/^.*\/work\/[^/]+\/[^/]+\//i, "");
   clean = clean.replace(/^[a-zA-Z]:\/a\/[^/]+\/[^/]+\//i, "");
   clean = clean.replace(/^.*(?:workspace)\//i, "");
+  clean = clean.replace(/^.*\/healops-sandbox-[^/]+\//i, "");
+  clean = clean.replace(/^.*\/tmp\/[^/]+\//i, "");
   clean = clean.replace(/^([a-zA-Z0-9_\-]+)\/\1\//i, "");
   if (repoName) {
     const repoPrefix = new RegExp("^" + repoName + "/", "i");
@@ -137,6 +139,30 @@ export function extractCulpritLocation(logText) {
   const cleaned = cleanGHActionsLog(stripAnsi(rawText));
   const normalized = cleaned.replace(/\\/g, "/");
 
+  // 1. Check if log is or contains an ESLint JSON report
+  if (normalized.includes('"filePath"') && normalized.includes('"line"')) {
+    try {
+      const startIdx = normalized.indexOf("[");
+      const endIdx = normalized.lastIndexOf("]");
+      if (startIdx !== -1 && endIdx > startIdx) {
+        const jsonArr = JSON.parse(normalized.slice(startIdx, endIdx + 1));
+        if (Array.isArray(jsonArr)) {
+          for (const item of jsonArr) {
+            for (const msg of item.messages || []) {
+              if (msg.severity === 2 || msg.fatal) {
+                return {
+                  targetFile: cleanRepoFilePath(item.filePath),
+                  lineNum: msg.line || 1,
+                };
+              }
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Standard filename:line regex
   const match = normalized.match(CULPRIT_REGEX);
   if (match) {
     const rawPath = match[0].slice(0, match[0].lastIndexOf(":"));

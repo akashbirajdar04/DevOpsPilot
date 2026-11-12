@@ -89,11 +89,13 @@ export function autoFixUnusedVariable(line, symbol) {
     }
   }
 
-  // Fallback: prefix with _ if not an import or path
-  return line.replace(
-    new RegExp(`(?<!['"/])\\b${cleanSym}\\b(?!['"/])`, "g"),
-    `_${cleanSym}`
-  );
+  // 5. Standalone unused variable declaration: const foo = ...; -> remove statement
+  if (new RegExp(`^\\s*(?:const|let|var)\\s+${symPattern}\\s*=[^;]+;?\\s*$`).test(line)) {
+    return "";
+  }
+
+  // If not a safe deterministic pattern, do not blindly prefix with _ (which breaks JSX and doesn't satisfy ESLint)
+  return line;
 }
 
 export const renameUnusedIdentifier = autoFixUnusedVariable;
