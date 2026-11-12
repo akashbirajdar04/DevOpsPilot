@@ -312,6 +312,11 @@ export class GitPatchApplier {
    */
   async recordOriginalCommit() {
     try {
+      // Discard any unintentional lockfile changes from environment/setup
+      await execa("git", ["checkout", "--", "package-lock.json"], { cwd: this.workspaceDir }).catch(() => {});
+      await execa("git", ["checkout", "--", "*/package-lock.json"], { cwd: this.workspaceDir, shell: true }).catch(() => {});
+      await execa("git", ["checkout", "--", "*/*/package-lock.json"], { cwd: this.workspaceDir, shell: true }).catch(() => {});
+
       const { stdout } = await execa("git", ["rev-parse", "HEAD"], {
         cwd: this.workspaceDir,
       });

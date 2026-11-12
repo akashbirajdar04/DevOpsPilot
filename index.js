@@ -187,7 +187,7 @@ export default function healOpsApp(app, optionsOrBootTime) {
 
       try {
         app.log.info(`Installing dependencies in sandbox (${installCwd})...`);
-        await execa(`npm install --include=dev --prefer-offline`, {
+        await execa(`npm install --no-save --include=dev --prefer-offline`, {
           cwd: installCwd,
           shell: true,
           env: {
@@ -198,6 +198,9 @@ export default function healOpsApp(app, optionsOrBootTime) {
         });
       } catch (npmErr) {
         app.log.warn(`Sandbox dependency install note: ${npmErr.message}`);
+      } finally {
+        // Discard any unintentional lockfile or working tree modifications from npm install
+        await execa(`git checkout -- .`, { cwd: workspaceDir, shell: true }).catch(() => {});
       }
     } catch (cloneErr) {
       app.log.warn(`Could not clone repo into sandbox: ${cloneErr.message}. Falling back to remote Octokit fetching.`);
