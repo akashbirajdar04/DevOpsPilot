@@ -18,7 +18,9 @@ CRITICAL INSTRUCTIONS:
 }
 
 2. Patch Rules:
-   - The patch field MUST be a valid unified diff hunk starting with '@@ -... +... @@'.
+   - The patch field MUST be a valid unified diff hunk starting with '@@ -... +... @@' OR a SEARCH/REPLACE block (<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE).
+   - For React/JSX files, prefer surgical SEARCH/REPLACE blocks to preserve surrounding JSX tag nesting.
+   - Ensure the patch produces 100% valid syntax with all JSX tags, brackets, and braces strictly balanced.
    - Never output omission comments (e.g., '// rest of code').
    - For unused catch parameters: rewrite 'catch (e)' to ECMAScript standard optional catch binding 'catch {}'. Never rename to '_e'.
    - For unused imports: remove the unused specifier or the whole statement. Never rename identifiers in module import paths.
@@ -149,7 +151,7 @@ ${codeContext}
 \`\`\`
 
 TASK:
-Identify the bug and generate a unified diff patch to fix it. Return ONLY the strict JSON object.`;
+Identify the bug and generate a surgical patch (unified diff hunk or SEARCH/REPLACE block) to fix it without syntax errors. Return ONLY the strict JSON object.`;
 
     return globalGroqMutex.runExclusive(async () => {
       let attempts = 0;

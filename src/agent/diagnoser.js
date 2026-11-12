@@ -449,70 +449,100 @@ export class DiagnoserAgent {
         targetSnippet = culprit.lineWindow || "";
       }
 
-      const errorText = Array.isArray(culprit.errors) && culprit.errors.length > 0
+      const initialErrorText = Array.isArray(culprit.errors) && culprit.errors.length > 0
         ? culprit.errors.slice(0, 3).join("\n")
         : `CI failure at line ${culprit.lineNum || 1}`;
 
-      // Request structured patch from Groq with schema validation & 429 backoff
-      const aiResponse = await this.groqClient.requestStructuredPatch({
-        targetFile,
-        errorDetails: errorText,
-        codeContext: targetSnippet,
-      });
+      const MAX_FILE_ATTEMPTS = 2;
+      let fileSuccess = false;
+      let lastFailureReason = "";
 
-      report.setAIResult({
-        status: aiResponse.success ? "success" : "rejected",
-        retries: aiResponse.retries,
-        tokenUsage: aiResponse.tokenUsage,
-        explanation: aiResponse.data?.explanation || "",
-        error: aiResponse.error,
-      });
+      for (let attempt = 1; attempt <= MAX_FILE_ATTEMPTS; attempt++) {
+        const errorDetails = attempt === 1
+          ? initialErrorText
+          : `${initialErrorText}\n\nPREVIOUS ATTEMPT FAILED WITH ERROR:\n${lastFailureReason}\nCRITICAL: Ensure the patch produces 100% valid syntax without missing closing tags, dangling brackets, or syntax errors.`;
 
-      if (!aiResponse.success || !aiResponse.data) {
-        this.logger.warn(`AI patch rejected for '${targetFile}': ${aiResponse.error}`);
-        report.setPatchValidation({
-          status: "rejected",
-          schemaValid: false,
-          reason: aiResponse.error || "AI failed to generate valid structured patch.",
+        // Request structured patch from Groq with schema validation & 429 backoff
+        const aiResponse = await this.groqClient.requestStructuredPatch({
+          targetFile,
+          errorDetails,
+          codeContext: targetSnippet,
         });
+
+        report.setAIResult({
+          status: aiResponse.success ? "success" : "rejected",
+          retries: aiResponse.retries,
+          tokenUsage: aiResponse.tokenUsage,
+          explanation: aiResponse.data?.explanation || "",
+          error: aiResponse.error,
+        });
+
+        if (!aiResponse.success || !aiResponse.data) {
+          lastFailureReason = aiResponse.error || "AI failed to generate valid structured patch.";
+          this.logger.warn(`AI patch rejected for '${targetFile}' (attempt ${attempt}/${MAX_FILE_ATTEMPTS}): ${lastFailureReason}`);
+          if (attempt === MAX_FILE_ATTEMPTS) {
+            report.setPatchValidation({
+              status: "rejected",
+              schemaValid: false,
+              reason: lastFailureReason,
+            });
+            if (this.gitApplier) await this.gitApplier.rollback();
+            return report.finalize("REJECTED");
+          }
+          continue;
+        }
+
+        const proposal = aiResponse.data;
+        if (proposal.status === "no_fix") {
+          this.logger.info(`AI proposed 'no_fix' for '${targetFile}': ${proposal.explanation}`);
+          if (this.gitApplier) await this.gitApplier.rollback();
+          return report.finalize("FAILED");
+        }
+
+        report.setPatchValidation({
+          status: "passed",
+          schemaValid: true,
+          gitCheckValid: true,
+        });
+
+        // 4. Apply patch deterministically using git apply & safety checks
+        if (this.gitApplier) {
+          const patchResult = await this.gitApplier.applyPatch({
+            patchText: proposal.patch,
+            targetFile,
+            allowedFiles: effectiveAllowed,
+          });
+
+          report.setPatchApplication(patchResult);
+
+          if (!patchResult.success) {
+            lastFailureReason = patchResult.reason;
+            this.logger.warn(
+              `Patch application rejected for '${targetFile}' (attempt ${attempt}/${MAX_FILE_ATTEMPTS}): ${patchResult.reason}`
+            );
+
+            // Rollback changes from this failed attempt before trying attempt 2
+            await this.gitApplier.rollback();
+
+            if (attempt === MAX_FILE_ATTEMPTS) {
+              return report.finalize("REJECTED");
+            }
+            continue;
+          }
+
+          report.modifiedFiles.push(...patchResult.modifiedFiles);
+        }
+
+        // Record root cause explanation
+        report.rootCause = `Remediation in ${targetFile}: ${proposal.explanation}`;
+        fileSuccess = true;
+        break;
+      }
+
+      if (!fileSuccess) {
         if (this.gitApplier) await this.gitApplier.rollback();
         return report.finalize("REJECTED");
       }
-
-      const proposal = aiResponse.data;
-      if (proposal.status === "no_fix") {
-        this.logger.info(`AI proposed 'no_fix' for '${targetFile}': ${proposal.explanation}`);
-        if (this.gitApplier) await this.gitApplier.rollback();
-        return report.finalize("FAILED");
-      }
-
-      report.setPatchValidation({
-        status: "passed",
-        schemaValid: true,
-        gitCheckValid: true,
-      });
-
-      // 4. Apply patch deterministically using git apply & safety checks
-      if (this.gitApplier) {
-        const patchResult = await this.gitApplier.applyPatch({
-          patchText: proposal.patch,
-          targetFile,
-          allowedFiles: effectiveAllowed,
-        });
-
-        report.setPatchApplication(patchResult);
-
-        if (!patchResult.success) {
-          this.logger.warn(`Patch application rejected for '${targetFile}': ${patchResult.reason}`);
-          await this.gitApplier.rollback();
-          return report.finalize("REJECTED");
-        }
-
-        report.modifiedFiles.push(...patchResult.modifiedFiles);
-      }
-
-      // Record root cause explanation
-      report.rootCause = `Remediation in ${targetFile}: ${proposal.explanation}`;
     }
 
     // 5. Multi-stage independent CI verification with iterative healing (Max 2 turns)

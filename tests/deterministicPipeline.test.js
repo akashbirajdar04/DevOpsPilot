@@ -848,3 +848,92 @@ test("Scenario 21: ESLint warning isolation verifies cleanly when 0 fatal errors
     await ws.cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Scenario 22: Groq patch introducing syntax error receives feedback and recovers on Attempt 2
+// ---------------------------------------------------------------------------
+test("Scenario 22: Groq patch introducing syntax error receives feedback and recovers on Attempt 2", async () => {
+  const ws = await createGitWorkspace(
+    "src/calc.js",
+    "export function calc() {\n  const x = 10;\n  return x;\n}\n"
+  );
+  try {
+    const sandbox = new Sandbox(ws.dir);
+    const tools = new AgentTools({ workspaceDir: ws.dir, sandbox });
+
+    const agent = new DiagnoserAgent({
+      tools,
+      apiKey: "mock-key",
+      model: "openai/gpt-oss-120b",
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+
+    let patchAttempt = 0;
+    agent.groqClient.requestStructuredPatch = async ({ targetFile, errorDetails }) => {
+      patchAttempt++;
+      if (patchAttempt === 1) {
+        // Attempt 1: AI introduces a syntax error
+        return {
+          success: true,
+          data: {
+            status: "fix_proposed",
+            file: "src/calc.js",
+            fix_type: "syntax_error",
+            patch: `<<<<<<< SEARCH
+  const x = 10;
+=======
+  const x = ;
+>>>>>>> REPLACE`,
+            explanation: "Broken patch with syntax error",
+          },
+          tokenUsage: { promptTokens: 90, completionTokens: 30, totalTokens: 120 },
+          retries: 0,
+        };
+      } else {
+        // Attempt 2: AI receives syntax error feedback and fixes it
+        assert.ok(errorDetails.includes("PREVIOUS ATTEMPT FAILED WITH ERROR"));
+        assert.ok(errorDetails.includes("Syntax error"));
+        return {
+          success: true,
+          data: {
+            status: "fix_proposed",
+            file: "src/calc.js",
+            fix_type: "syntax_error",
+            patch: `<<<<<<< SEARCH
+  const x = 10;
+=======
+  const x = 20;
+>>>>>>> REPLACE`,
+            explanation: "Corrected patch with valid syntax",
+          },
+          tokenUsage: { promptTokens: 110, completionTokens: 30, totalTokens: 140 },
+          retries: 0,
+        };
+      }
+    };
+
+    const report = await agent.runDeterministicRemediationPipeline({
+      culprits: [{ targetFile: "src/calc.js", lineNum: 2, errors: ["broken line"] }],
+      repo: "owner/repo",
+      runId: 7777,
+      runAttempt: 1,
+      explicitChecks: {
+        tests: {
+          command: 'node -e "process.exit(0)"',
+          cwd: ws.dir,
+        },
+      },
+    });
+
+    assert.equal(patchAttempt, 2);
+    assert.equal(report.finalState, "VERIFIED");
+
+    const modifiedContent = await fs.readFile(ws.filePath, "utf-8");
+    assert.equal(
+      modifiedContent.replace(/\r\n/g, "\n"),
+      "export function calc() {\n  const x = 20;\n  return x;\n}\n"
+    );
+  } finally {
+    await ws.cleanup();
+  }
+});
